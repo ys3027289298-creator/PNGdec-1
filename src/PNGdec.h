@@ -157,6 +157,20 @@ typedef struct png_image_tag
     int iInterlaced;
     uint32_t iTransparent; // transparent color index/value
     int iError;
+    // APNG (animated PNG) state
+    uint8_t ucIsAPNG;     // true if an acTL chunk was found
+    uint8_t ucDisposeOp;  // dispose op of the frame being decoded
+    uint8_t ucBlendOp;    // blend op of the frame being decoded
+    uint8_t ucPendDispose;// dispose op of the previously decoded frame
+    int iNumFrames;       // total frame count from the acTL chunk
+    int iNumPlays;        // number of times to play (0 = forever)
+    int iFrame;           // index of the next frame to decode
+    int iFrameDelay;      // delay in ms of the most recently decoded frame
+    int iFrameX, iFrameY, iFrameW, iFrameH; // current frame rectangle
+    int iPendX, iPendY, iPendW, iPendH;     // previous frame rectangle
+    int32_t iFrameOffset; // file offset of the next frame's first chunk
+    uint8_t *pSavedRect;  // saved pixels for DISPOSE_OP_PREVIOUS
+    int iSavedRectSize;   // allocated size of pSavedRect
     PNG_READ_CALLBACK *pfnRead;
     PNG_SEEK_CALLBACK *pfnSeek;
     PNG_OPEN_CALLBACK *pfnOpen;
@@ -186,6 +200,8 @@ class PNG
     int getWidth();
     int getHeight();
     int getBpp();
+    int getFrameCount();
+    int getFrameDelay();
     int hasAlpha();
     uint32_t getTransparentColor();
     int isInterlaced();
@@ -208,6 +224,8 @@ int PNG_openRAM(PNGIMAGE *pPNG, uint8_t *pData, int iDataSize, PNG_DRAW_CALLBACK
 int PNG_openFile(PNGIMAGE *pPNG, const char *szFilename, PNG_DRAW_CALLBACK *pfnDraw);
 int PNG_getWidth(PNGIMAGE *pPNG);
 int PNG_getHeight(PNGIMAGE *pPNG);
+int PNG_getFrameCount(PNGIMAGE *pPNG);
+int PNG_getFrameDelay(PNGIMAGE *pPNG);
 int PNG_decode(PNGIMAGE *pPNG, void *pUser, int iOptions);
 void PNG_close(PNGIMAGE *pPNG);
 int PNG_getLastError(PNGIMAGE *pPNG);

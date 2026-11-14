@@ -1,0 +1,10 @@
+sizeof(PNGIMAGE)=59632 bytes
+STATIC samples/static_rgba.png rc=0 err=0 8x8 type=6 bpp=8 hash=5637b19c21f77325
+STATIC samples/static_rgb.png rc=0 err=0 7x5 type=2 bpp=8 hash=9f843cfece70dc03
+STATIC samples/static_gray.png rc=0 err=0 8x3 type=0 bpp=8 hash=3a0f9a885daf884d
+STATIC samples/static_idx.png rc=0 err=0 6x6 type=3 bpp=8 hash=f6e31118e06b5835
+STATIC samples/static_idx.png rc=0 err=0 6x6 type=3 bpp=8 hash=f6e31118e06b5835
+STATIC ../../test_images/homer_2bpp.png rc=0 err=0 800x480 type=0 bpp=2 hash=ae0dfa7fd5b137a9
+STATIC_CB ../../test_images/homer_2bpp.png rc=0 err=0 lines=480 hash=ae0dfa7fd5b137a9
+STATIC ../../perf_small.png rc=0 err=0 1478x396 type=3 bpp=4 hash=96378ce0329047da
+PERF ../../perf_small.png rc=0 loops=100 total_ms=129.9 per_decode_us=1299.0

@@ -1,0 +1,38 @@
+sizeof(PNGIMAGE)=59704 bytes
+STATIC samples/static_rgba.png rc=0 err=0 8x8 type=6 bpp=8 hash=5637b19c21f77325
+STATIC samples/static_rgb.png rc=0 err=0 7x5 type=2 bpp=8 hash=9f843cfece70dc03
+STATIC samples/static_gray.png rc=0 err=0 8x3 type=0 bpp=8 hash=3a0f9a885daf884d
+STATIC samples/static_idx.png rc=0 err=0 6x6 type=3 bpp=8 hash=f6e31118e06b5835
+STATIC samples/static_idx.png rc=0 err=0 6x6 type=3 bpp=8 hash=f6e31118e06b5835
+STATIC ../../test_images/homer_2bpp.png rc=0 err=0 800x480 type=0 bpp=2 hash=ae0dfa7fd5b137a9
+STATIC_CB ../../test_images/homer_2bpp.png rc=0 err=0 lines=480 hash=ae0dfa7fd5b137a9
+STATIC ../../perf_small.png rc=0 err=0 1478x396 type=3 bpp=4 hash=96378ce0329047da
+PERF ../../perf_small.png rc=0 loops=100 total_ms=144.9 per_decode_us=1449.0
+APNG samples/apng5.png frames=5 8x8 type=6
+APNG frame 0 rc=0 err=0 delay=100 ms
+APNG frame 1 rc=0 err=0 delay=200 ms
+APNG frame 2 rc=0 err=0 delay=50 ms
+APNG frame 3 rc=0 err=0 delay=30 ms
+APNG frame 4 rc=0 err=0 delay=500 ms
+APNG restart rc=0 delay=100 pixels_match_frame0=yes
+APNG samples/apng_multifdat.png frames=5 8x8 type=6
+APNG frame 0 rc=0 err=0 delay=100 ms
+APNG frame 1 rc=0 err=0 delay=200 ms
+APNG frame 2 rc=0 err=0 delay=50 ms
+APNG frame 3 rc=0 err=0 delay=30 ms
+APNG frame 4 rc=0 err=0 delay=500 ms
+APNG restart rc=0 delay=100 pixels_match_frame0=yes
+APNG samples/apng_nodefault.png frames=5 8x8 type=6
+APNG frame 0 rc=0 err=0 delay=100 ms
+APNG frame 1 rc=0 err=0 delay=200 ms
+APNG frame 2 rc=0 err=0 delay=50 ms
+APNG frame 3 rc=0 err=0 delay=30 ms
+APNG frame 4 rc=0 err=0 delay=500 ms
+APNG restart rc=0 delay=100 pixels_match_frame0=yes
+CROSSCHECK apng_frame0_vs_static_rgba pixels_match=yes
+CORRUPT samples/apng_trunc.png : failed_at_frame=2 rc=1 err=2 -> PASS
+CORRUPT samples/apng_bitflip.png : failed_at_frame=1 rc=2 err=2 -> PASS
+CORRUPT samples/apng_badrect.png : failed_at_frame=1 rc=1 err=2 -> PASS
+CORRUPT samples/apng_baddispose.png : failed_at_frame=2 rc=1 err=2 -> PASS
+CORRUPT samples/apng_zerow.png : failed_at_frame=1 rc=1 err=2 -> PASS
+CORRUPT samples/apng_extralines.png : failed_at_frame=1 rc=2 err=2 -> PASS

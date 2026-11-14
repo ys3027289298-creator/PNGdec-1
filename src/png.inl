@@ -114,6 +114,11 @@ int PNG_openFile(PNGIMAGE *pPNG, const char *szFilename, PNG_DRAW_CALLBACK *pfnD
 #endif // __LINUX__
 void PNG_close(PNGIMAGE *pPNG)
 {
+    if (pPNG->pSavedRect) {
+        free(pPNG->pSavedRect);
+        pPNG->pSavedRect = NULL;
+        pPNG->iSavedRectSize = 0;
+    }
     if (pPNG->pfnClose)
         (*pPNG->pfnClose)(pPNG->PNGFile.fHandle);
 } /* PNG_close() */
@@ -127,6 +132,16 @@ int PNG_getHeight(PNGIMAGE *pPNG)
 {
     return pPNG->iHeight;
 } /* PNG_getHeight() */
+
+int PNG_getFrameCount(PNGIMAGE *pPNG)
+{
+    return (pPNG->ucIsAPNG) ? pPNG->iNumFrames : 1;
+} /* PNG_getFrameCount() */
+
+int PNG_getFrameDelay(PNGIMAGE *pPNG)
+{
+    return pPNG->iFrameDelay;
+} /* PNG_getFrameDelay() */
 
 int PNG_getLastError(PNGIMAGE *pPNG)
 {
@@ -625,6 +640,14 @@ PNG_STATIC int PNGParseInfo(PNGIMAGE *pPage)
     int iBytesRead;
     
     pPage->iHasAlpha = pPage->iInterlaced = 0;
+    pPage->ucIsAPNG = 0;
+    pPage->ucPendDispose = 0;
+    pPage->iNumFrames = pPage->iNumPlays = 0;
+    pPage->iFrame = 0;
+    pPage->iFrameDelay = 0;
+    pPage->iFrameOffset = 8;
+    pPage->pSavedRect = NULL;
+    pPage->iSavedRectSize = 0;
     pPage->szComment[0] = 0;
     // Read a few bytes to just parse the size/pixel info
     iBytesRead = (*pPage->pfnRead)(&pPage->PNGFile, s, 33);
@@ -690,6 +713,15 @@ PNG_STATIC int PNGParseInfo(PNGIMAGE *pPage)
     }
     if ((pPage->iPitch+1)*2 + 32 > PNG_MAX_BUFFERED_PIXELS)
        return PNG_TOO_BIG;
+
+    // Check if this is an animated PNG (acTL chunk must appear before the first IDAT)
+    iBytesRead = (*pPage->pfnRead)(&pPage->PNGFile, s, 20);
+    if (iBytesRead == 20 && MOTOLONG(s) == 8 && MOTOLONG(&s[4]) == 0x6163544c/*'acTL'*/) {
+        pPage->iNumFrames = MOTOLONG(&s[8]);
+        pPage->iNumPlays = MOTOLONG(&s[12]);
+        if (pPage->iNumFrames > 0)
+            pPage->ucIsAPNG = 1;
+    }
 
     return PNG_SUCCESS;
 } /* PNGParseInfo() */
@@ -799,17 +831,60 @@ PNG_STATIC int PNGInit(PNGIMAGE *pPNG)
     return PNGParseInfo(pPNG); // gather info for image
 } /* PNGInit() */
 //
+// Alpha-blend one line of APNG frame pixels over the canvas (blend_op = OVER)
+// Only 8-bit grayscale+alpha and truecolor+alpha pixel types get here
+//
+PNG_STATIC void APNGBlendLine(uint8_t *pDst, uint8_t *pSrc, int iWidth, int iBytesPerPixel)
+{
+    int x, a;
+    if (iBytesPerPixel == 4) { // truecolor + alpha
+        for (x=0; x<iWidth; x++) {
+            a = pSrc[3];
+            if (a == 255) { // fully opaque, just copy
+                memcpy(pDst, pSrc, 4);
+            } else if (a != 0) { // partially transparent, blend it
+                pDst[0] = (uint8_t)((pSrc[0] * a + pDst[0] * (255 - a)) / 255);
+                pDst[1] = (uint8_t)((pSrc[1] * a + pDst[1] * (255 - a)) / 255);
+                pDst[2] = (uint8_t)((pSrc[2] * a + pDst[2] * (255 - a)) / 255);
+                pDst[3] = (uint8_t)(a + (pDst[3] * (255 - a)) / 255);
+            } // a == 0 leaves the canvas pixel unchanged
+            pSrc += 4;
+            pDst += 4;
+        }
+    } else { // grayscale + alpha
+        for (x=0; x<iWidth; x++) {
+            a = pSrc[1];
+            if (a == 255) {
+                pDst[0] = pSrc[0];
+                pDst[1] = 255;
+            } else if (a != 0) {
+                pDst[0] = (uint8_t)((pSrc[0] * a + pDst[0] * (255 - a)) / 255);
+                pDst[1] = (uint8_t)(a + (pDst[1] * (255 - a)) / 255);
+            }
+            pSrc += 2;
+            pDst += 2;
+        }
+    }
+} /* APNGBlendLine() */
+//
 // Decode the PNG file
 //
 // You must call open() before calling decode()
 // This function can be called repeatedly without having
 // to close and re-open the file
+// For animated PNG files, each call decodes the next frame into the
+// user-supplied image buffer (the full canvas). Call getFrameCount()
+// to know how many frames exist and getFrameDelay() for the delay (in
+// milliseconds) of the most recently decoded frame. Once all frames
+// have been decoded, the next call starts over from the first frame.
 //
 PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
 {
     int err, y, iLen=0;
     int bDone, iOffset, iFileOffset, iBytesRead, iAvailable;
     int iMarker=0;
+    int iDecodeHeight, iLinePitch, iBytesPerPixel = 1;
+    int bGotFCTL = FALSE, bSawIDAT = FALSE, bUseIDAT = FALSE;
     uint8_t *tmp, *pCurr, *pPrev;
     z_stream d_stream; /* decompression stream */
     uint8_t *s = pPage->ucFileBuf;
@@ -820,6 +895,54 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
         pPage->iError = PNG_NO_BUFFER;
         return 0;
     }
+    if (pPage->ucIsAPNG) {
+        // APNG frames are composited onto a full canvas, so a user-supplied
+        // image buffer is required (callback-only mode is not supported)
+        if (pPage->pImage == NULL) {
+            pPage->iError = PNG_NO_BUFFER;
+            return 0;
+        }
+        if (pPage->ucBpp != 8) { // only 8-bit-per-sample APNG files are supported
+            pPage->iError = PNG_UNSUPPORTED_FEATURE;
+            return 1;
+        }
+        switch (pPage->ucPixelType) { // bytes per pixel for compositing
+            case PNG_PIXEL_GRAYSCALE:
+            case PNG_PIXEL_INDEXED:
+                iBytesPerPixel = 1;
+                break;
+            case PNG_PIXEL_GRAY_ALPHA:
+                iBytesPerPixel = 2;
+                break;
+            case PNG_PIXEL_TRUECOLOR:
+                iBytesPerPixel = 3;
+                break;
+            default: // PNG_PIXEL_TRUECOLOR_ALPHA
+                iBytesPerPixel = 4;
+                break;
+        }
+        if (pPage->iFrame >= pPage->iNumFrames) { // played all frames; start over
+            pPage->iFrame = 0;
+            pPage->iFrameOffset = 8;
+            pPage->ucPendDispose = 0;
+        }
+        if (pPage->iFrame == 0) { // the canvas starts as transparent black
+            memset(pPage->pImage, 0, pPage->iHeight * pPage->iPitch);
+        } else { // apply the previous frame's dispose operation
+            uint8_t *pBase = &pPage->pImage[pPage->iPendY * pPage->iPitch + pPage->iPendX * iBytesPerPixel];
+            int i, iRowBytes = pPage->iPendW * iBytesPerPixel;
+            if (pPage->ucPendDispose == 1) { // APNG_DISPOSE_BACKGROUND
+                for (i=0; i<pPage->iPendH; i++)
+                    memset(&pBase[i * pPage->iPitch], 0, iRowBytes);
+            } else if (pPage->ucPendDispose == 2 && pPage->pSavedRect != NULL) { // APNG_DISPOSE_PREVIOUS
+                for (i=0; i<pPage->iPendH; i++)
+                    memcpy(&pBase[i * pPage->iPitch], &pPage->pSavedRect[i * iRowBytes], iRowBytes);
+            }
+            pPage->ucPendDispose = 0;
+        }
+    }
+    iDecodeHeight = pPage->iHeight;
+    iLinePitch = pPage->iPitch;
     // Use internal buffer to maintain the current and previous lines
     y = (int)(intptr_t)&pPage->ucPixels[0];
     y &= 15; // make sure we're 16-byte aligned, -1 for filter byte
@@ -849,7 +972,7 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
 //        err = mz_inflateInit2(&d_stream, 15);
 #endif // FUTURE
     
-    iFileOffset = 8; // skip PNG file signature
+    iFileOffset = (pPage->ucIsAPNG) ? pPage->iFrameOffset : 8; // skip PNG file signature
     iOffset = 0; // internal buffer offset starts at 0
     iBytesRead = 0; // We haven't read yet anything
     y = 0;
@@ -887,13 +1010,67 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                 break;
             case 0x67414d41: //'gAMA'
                 break;
-#ifdef FUTURE
-            case 0x6663544C: //'fcTL' frame control block for animated PNG (need to get size of this partial image)
-                pPage->iWidth = MOTOLONG(&pPage->pData[iOffset + 4]); // frame width
-                pPage->iHeight = MOTOLONG(&pPage->pData[iOffset + 8]); // frame height
-                bDone = TRUE;
+            case 0x6163544c: //'acTL' animation control (already parsed in PNGParseInfo)
                 break;
-#endif
+            case 0x6663544c: //'fcTL' frame control block for animated PNG
+                if (pPage->ucIsAPNG) {
+                    uint8_t ucTemp[32], *pF;
+                    int i, iSaveSize;
+                    if (iLen != 26) { // fcTL data must be exactly 26 bytes
+                        pPage->iError = PNG_DECODE_ERROR;
+                        return 1;
+                    }
+                    if (iAvailable >= 26) {
+                        pF = &s[iOffset];
+                    } else { // straddles the file buffer boundary; read it directly
+                        (*pPage->pfnSeek)(&pPage->PNGFile, iFileOffset - iBytesRead + iOffset);
+                        if ((*pPage->pfnRead)(&pPage->PNGFile, ucTemp, 26) != 26) {
+                            pPage->iError = PNG_DECODE_ERROR;
+                            return 1;
+                        }
+                        pF = ucTemp;
+                    }
+                    pPage->iFrameW = MOTOLONG(&pF[4]);
+                    pPage->iFrameH = MOTOLONG(&pF[8]);
+                    pPage->iFrameX = MOTOLONG(&pF[12]);
+                    pPage->iFrameY = MOTOLONG(&pF[16]);
+                    i = MOTOSHORT(&pF[20]); // delay numerator
+                    pPage->iFrameDelay = MOTOSHORT(&pF[22]); // delay denominator
+                    if (pPage->iFrameDelay == 0) // 0 means 100 per the spec
+                        pPage->iFrameDelay = 100;
+                    pPage->iFrameDelay = (i * 1000) / pPage->iFrameDelay; // delay in milliseconds
+                    pPage->ucDisposeOp = pF[24];
+                    pPage->ucBlendOp = pF[25];
+                    if (pPage->iFrameW <= 0 || pPage->iFrameH <= 0 ||
+                        pPage->iFrameX < 0 || pPage->iFrameY < 0 ||
+                        pPage->iFrameX > pPage->iWidth - pPage->iFrameW ||
+                        pPage->iFrameY > pPage->iHeight - pPage->iFrameH ||
+                        pPage->ucDisposeOp > 2 || pPage->ucBlendOp > 1) {
+                        pPage->iError = PNG_DECODE_ERROR; // invalid frame rectangle or ops
+                        return 1;
+                    }
+                    iDecodeHeight = pPage->iFrameH;
+                    iLinePitch = pPage->iFrameW * iBytesPerPixel;
+                    // The default image (IDAT) is only frame data if the first
+                    // fcTL appeared before it; otherwise frames use fdAT chunks
+                    bUseIDAT = (pPage->iFrame == 0 && !bSawIDAT);
+                    bGotFCTL = TRUE;
+                    if (pPage->ucDisposeOp == 2) { // DISPOSE_PREVIOUS needs a save buffer
+                        iSaveSize = iLinePitch * pPage->iFrameH;
+                        if (iSaveSize > pPage->iSavedRectSize) {
+                            if (pPage->pSavedRect)
+                                free(pPage->pSavedRect);
+                            pPage->pSavedRect = (uint8_t *)malloc(iSaveSize);
+                            if (pPage->pSavedRect == NULL) {
+                                pPage->iSavedRectSize = 0;
+                                pPage->iError = PNG_MEM_ERROR;
+                                return 1;
+                            }
+                            pPage->iSavedRectSize = iSaveSize;
+                        }
+                    }
+                }
+                break;
             case 0x504c5445: //'PLTE' palette colors
                 memset(&pPage->ucPalette[768], 0xff, 256); // assume all colors are opaque unless specified
                 if (iLen > 0 && iLen <= 768 && iLen <= iAvailable) {
@@ -932,13 +1109,47 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                     pPage->iHasAlpha = 1;
                 }
                 break;
+            case 0x66644154: //'fdAT' APNG frame data block
+                if (!pPage->ucIsAPNG || !bGotFCTL || bUseIDAT)
+                    break; // not part of the current frame; skip it
+                if (iLen < 4) { // must at least hold the sequence number
+                    pPage->iError = PNG_DECODE_ERROR;
+                    return 1;
+                }
+                // skip the 4-byte sequence number, then treat it like IDAT
+                if (iBytesRead - iOffset < 4) { // not fully in the buffer; skip via seek
+                    iFileOffset += (iOffset - iBytesRead) + 4;
+                    (*pPage->pfnSeek)(&pPage->PNGFile, iFileOffset);
+                    iBytesRead = 0;
+                    iOffset = 0;
+                } else {
+                    iOffset += 4;
+                }
+                iLen -= 4;
+                if (iLen == 0)
+                    break; // empty frame data chunk
+                // fall through and decode it like IDAT
             case 0x49444154: //'IDAT' image data block
+                if (pPage->ucIsAPNG) {
+                    if (iMarker == 0x49444154) {
+                        if (!bGotFCTL || !bUseIDAT) {
+                            bSawIDAT = TRUE; // default image is not part of the animation
+                            break; // skip it
+                        }
+                    } else if (!bGotFCTL || bUseIDAT) {
+                        break; // fdAT which is not part of the current frame
+                    }
+                }
                 while (iLen) {
                     if (iOffset >= iBytesRead) {
                         // we ran out of data; get some more
                         iBytesRead = (*pPage->pfnRead)(&pPage->PNGFile, pPage->ucFileBuf, (iLen > PNG_FILE_BUF_SIZE) ? PNG_FILE_BUF_SIZE : iLen);
                         iFileOffset += iBytesRead;
                         iOffset = 0;
+                        if (iBytesRead <= 0) { // file is truncated; no more data will come
+                            pPage->iError = PNG_DECODE_ERROR;
+                            return 1;
+                        }
                     } else {
                         // number of bytes remaining in buffer
                         iBytesRead -= iOffset;
@@ -964,12 +1175,20 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                     err = 0;
                     while (err == Z_OK) {
                         if (d_stream.avail_out == 0) { // reset for next line
-                            d_stream.avail_out = pPage->iPitch+1;
+                            if (pPage->ucIsAPNG && y >= iDecodeHeight) {
+                                // the frame stream produced more lines than its
+                                // fcTL height allows; reject it before any
+                                // out-of-bounds write can happen
+                                pPage->iError = PNG_DECODE_ERROR;
+                                err = Z_DATA_ERROR;
+                                break;
+                            }
+                            d_stream.avail_out = iLinePitch+1;
                             d_stream.next_out = pCurr;
                         } // otherwise it could be a continuation of an unfinished line
                         err = inflate(&d_stream, Z_NO_FLUSH, iOptions & PNG_CHECK_CRC);
                         if ((err == Z_OK || err == Z_STREAM_END) && d_stream.avail_out == 0) {// successfully decoded line
-                            DeFilter(pCurr, pPrev, pPage->iWidth, pPage->iPitch);
+                            DeFilter(pCurr, pPrev, (pPage->ucIsAPNG) ? pPage->iFrameW : pPage->iWidth, iLinePitch);
                             if (pPage->pImage == NULL) { // no image buffer, send it line by line
                                 PNGDRAW pngd;
                                 pngd.pUser = pUser;
@@ -986,6 +1205,17 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                                     pPage->iError = PNG_QUIT_EARLY;
                                     bDone = TRUE;
                                 }
+                            } else if (pPage->ucIsAPNG) {
+                                // composite the frame line into the canvas
+                                uint8_t *pDst = &pPage->pImage[(pPage->iFrameY + y) * pPage->iPitch + pPage->iFrameX * iBytesPerPixel];
+                                if (pPage->ucDisposeOp == 2 && pPage->pSavedRect != NULL) // save for DISPOSE_PREVIOUS
+                                    memcpy(&pPage->pSavedRect[y * iLinePitch], pDst, iLinePitch);
+                                if (pPage->ucBlendOp == 1 &&
+                                    (pPage->ucPixelType == PNG_PIXEL_TRUECOLOR_ALPHA || pPage->ucPixelType == PNG_PIXEL_GRAY_ALPHA)) {
+                                    APNGBlendLine(pDst, &pCurr[1], pPage->iFrameW, iBytesPerPixel);
+                                } else { // BLEND_SOURCE (OVER on non-alpha types is a plain copy too)
+                                    memcpy(pDst, &pCurr[1], iLinePitch);
+                                }
                             } else {
                                 // copy to destination bitmap
                                 memcpy(&pPage->pImage[y * pPage->iPitch], &pCurr[1], pPage->iPitch);
@@ -999,6 +1229,11 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                     }
                     if (err == Z_STREAM_END && d_stream.avail_out == 0) {
                         // successful decode, stop here
+                        if (pPage->ucIsAPNG && y != iDecodeHeight) {
+                            // the frame's zlib stream ended before all of its
+                            // lines were decoded; the frame data is corrupt
+                            pPage->iError = PNG_DECODE_ERROR;
+                        }
                         y = pPage->iHeight;
                         bDone = TRUE;
                     } else  if (err == Z_DATA_ERROR || err == Z_STREAM_ERROR) {
@@ -1051,5 +1286,22 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
         iOffset += (iLen + 4); // skip data + CRC
     } // while y < height
     err = inflateEnd(&d_stream);
+    if (pPage->ucIsAPNG) {
+        if (pPage->iError == PNG_SUCCESS && bDone) {
+            // frame decoded successfully; remember where the next one starts
+            pPage->iFrameOffset = iFileOffset - iBytesRead + iOffset;
+            pPage->iFrame++;
+            // remember this frame's dispose op for the next decode() call
+            pPage->ucPendDispose = pPage->ucDisposeOp;
+            pPage->iPendX = pPage->iFrameX;
+            pPage->iPendY = pPage->iFrameY;
+            pPage->iPendW = pPage->iFrameW;
+            pPage->iPendH = pPage->iFrameH;
+        } else {
+            if (pPage->iError == PNG_SUCCESS)
+                pPage->iError = PNG_DECODE_ERROR;
+            pPage->iFrame = pPage->iNumFrames; // restart from frame 0 on the next call
+        }
+    }
     return pPage->iError;
 } /* DecodePNG() */

@@ -20,6 +20,7 @@ The PNG image specification was written at a time when computers had megabytes o
 
 Feature summary:<br>
 ----------------<br>
+- *New* APNG (animated PNG) support: parses acTL/fcTL/fdAT chunks and composites each frame (see below)<br>
 - *New* Added PNGDisplay helper class to simplify displaying images on displays supported by my bb_spi_lcd library<br>
 - Runs on any MCU with at least 48K of free RAM<br>
 - No external dependencies (including malloc/free)<br>
@@ -30,6 +31,20 @@ Feature summary:<br>
 - Optionally disable zlib's internal CRC check - improves speed by 10-30%
 - Arduino-style C++ library class with simple API<br>
 - Can by built as straight C as well<br>
+<br>
+APNG (animated PNG):<br>
+--------------------<br>
+Files with an acTL chunk are decoded one frame per decode() call. Each frame is
+composited onto the full canvas (following the fcTL dispose/blend ops) in the
+user-supplied image buffer, so setBuffer() is required for animated files.
+Use getFrameCount() to query the number of frames and getFrameDelay() for the
+delay (in milliseconds) of the most recently decoded frame. After the last
+frame, the next decode() call restarts from the first frame. Limitations:
+only 8-bit-per-sample pixel types are supported, blend_op OVER is implemented
+for alpha pixel types (it degrades to SOURCE otherwise), and frames using
+DISPOSE_OP_PREVIOUS need an extra frame-rectangle-sized buffer (allocated with
+malloc, worst case = one canvas). Total RAM for APNG is bounded by
+sizeof(PNGIMAGE) + 2 x (canvas stride x canvas height).<br>
 <br>
 
 How fast is it?<br>
@@ -53,4 +68,3 @@ This project received funding through [NGI Zero Core](https://nlnet.nl/core), a 
 
 [<img src="https://nlnet.nl/logo/banner.png" alt="NLnet foundation logo" width="20%" />](https://nlnet.nl)
 [<img src="https://nlnet.nl/image/logos/NGI0_tag.svg" alt="NGI Zero Logo" width="20%" />](https://nlnet.nl/core)
-

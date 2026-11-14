@@ -111,6 +111,23 @@ int PNG::getHeight()
     return _png.iHeight;
 } /* getHeight() */
 //
+// Returns the number of frames in the image
+// For static PNG files this is always 1; for animated (APNG)
+// files it's the frame count from the acTL chunk
+//
+int PNG::getFrameCount()
+{
+    return (_png.ucIsAPNG) ? _png.iNumFrames : 1;
+} /* getFrameCount() */
+//
+// Returns the delay in milliseconds of the most recently decoded frame
+// For static PNG files this is always 0
+//
+int PNG::getFrameDelay()
+{
+    return _png.iFrameDelay;
+} /* getFrameDelay() */
+//
 // For truecolor and palette images, it's possible to have a single
 // transparent color defined. This call will return it if defined
 //
@@ -188,6 +205,11 @@ uint8_t * PNG::getPalette()
 //
 void PNG::close()
 {
+    if (_png.pSavedRect) {
+        free(_png.pSavedRect);
+        _png.pSavedRect = NULL;
+        _png.iSavedRectSize = 0;
+    }
     if (_png.pfnClose)
         (*_png.pfnClose)(_png.PNGFile.fHandle);
 } /* close() */
