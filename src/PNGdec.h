@@ -198,8 +198,110 @@ class PNG
     void setBuffer(uint8_t *pBuffer);
     uint8_t getAlphaMask(PNGDRAW *pDraw, uint8_t *pMask, uint8_t ucThreshold);
     void getLineAsRGB565(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd);
-
+    //
+    // Decode only the luminance (Y) channel of the image.
+    // Useful when previewing an image where color is not needed.
+    // Each pixel's Y value is computed during the decode with BT.601
+    // integer weights: Y = (77*R + 150*G + 29*B + 128) >> 8
+    // Pass a non-NULL pA to also receive the per-pixel alpha channel
+    // (255 for images without alpha). Buffers must be width*height bytes.
+    // Only 8 bits-per-channel sources are supported; any other bit depth
+    // returns PNG_UNSUPPORTED_FEATURE.
+    // Returns PNG_SUCCESS (0) or an error code (also in getLastError()).
+    //
+    int decodeLuminance(uint8_t *pY, uint8_t *pA = NULL) {
+        PNGLUMSTATE pls;
+        PNG_DRAW_CALLBACK *pfnOld;
+        uint8_t *pOldImage;
+        int rc;
+        if (pY == NULL) {
+            _png.iError = PNG_INVALID_PARAMETER;
+            return _png.iError;
+        }
+        if (_png.ucBpp != 8) { // only 8-bit per channel sources are supported
+            _png.iError = PNG_UNSUPPORTED_FEATURE;
+            return _png.iError;
+        }
+        pls.pY = pY;
+        pls.pA = pA;
+        pfnOld = _png.pfnDraw;
+        pOldImage = _png.pImage;
+        _png.pfnDraw = LumDraw;
+        _png.pImage = NULL; // force line-by-line decode through our callback
+        rc = decode(&pls, 0);
+        _png.pfnDraw = pfnOld; // restore the original decoder state
+        _png.pImage = pOldImage;
+        return rc;
+    } /* decodeLuminance() */
+    //
+    // Convert a line of native pixels (from your PNGDRAW callback) into
+    // 8-bit luminance (Y) and, optionally, the alpha channel.
+    // Call this from your draw callback to get luminance line by line.
+    // Returns PNG_SUCCESS (0) or PNG_UNSUPPORTED_FEATURE if the source
+    // bit depth is not 8 bits per channel.
+    //
+    int getLineAsLuminance(PNGDRAW *pDraw, uint8_t *pY, uint8_t *pA) {
+        if (pDraw == NULL || pY == NULL)
+            return PNG_INVALID_PARAMETER;
+        if (pDraw->iBpp != 8)
+            return PNG_UNSUPPORTED_FEATURE;
+        LumLine(pDraw, pY, pA);
+        return PNG_SUCCESS;
+    } /* getLineAsLuminance() */
   private:
+    typedef struct {
+        uint8_t *pY;
+        uint8_t *pA;
+    } PNGLUMSTATE;
+    // Convert one line of 8-bit/channel native pixels to luminance (+alpha)
+    static void LumLine(PNGDRAW *pDraw, uint8_t *pY, uint8_t *pA) {
+        int x;
+        uint8_t *s = pDraw->pPixels;
+        uint8_t *pPal;
+        switch (pDraw->iPixelType) {
+            case PNG_PIXEL_GRAYSCALE:
+                for (x=0; x<pDraw->iWidth; x++) {
+                    pY[x] = s[x];
+                    if (pA) pA[x] = 255;
+                }
+                break;
+            case PNG_PIXEL_GRAY_ALPHA:
+                for (x=0; x<pDraw->iWidth; x++) {
+                    pY[x] = s[0];
+                    if (pA) pA[x] = s[1];
+                    s += 2;
+                }
+                break;
+            case PNG_PIXEL_TRUECOLOR:
+                for (x=0; x<pDraw->iWidth; x++) {
+                    pY[x] = (uint8_t)((77*s[0] + 150*s[1] + 29*s[2] + 128) >> 8);
+                    if (pA) pA[x] = 255;
+                    s += 3;
+                }
+                break;
+            case PNG_PIXEL_TRUECOLOR_ALPHA:
+                for (x=0; x<pDraw->iWidth; x++) {
+                    pY[x] = (uint8_t)((77*s[0] + 150*s[1] + 29*s[2] + 128) >> 8);
+                    if (pA) pA[x] = s[3];
+                    s += 4;
+                }
+                break;
+            case PNG_PIXEL_INDEXED:
+                for (x=0; x<pDraw->iWidth; x++) {
+                    pPal = &pDraw->pPalette[s[x] * 3];
+                    pY[x] = (uint8_t)((77*pPal[0] + 150*pPal[1] + 29*pPal[2] + 128) >> 8);
+                    if (pA) pA[x] = (pDraw->iHasAlpha) ? pDraw->pPalette[768 + s[x]] : 255;
+                }
+                break;
+        }
+    } /* LumLine() */
+    // Internal draw callback used by decodeLuminance()
+    static int LumDraw(PNGDRAW *pDraw) {
+        PNGLUMSTATE *pState = (PNGLUMSTATE *)pDraw->pUser;
+        int iOff = pDraw->y * pDraw->iWidth;
+        LumLine(pDraw, &pState->pY[iOff], (pState->pA) ? &pState->pA[iOff] : NULL);
+        return 1; // continue decoding
+    } /* LumDraw() */
     PNGIMAGE _png;
 };
 #else
