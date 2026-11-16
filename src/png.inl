@@ -21,6 +21,31 @@
 //
 #include "zlib.h"
 //
+// Decode-time smoothing (optional feature)
+//
+// To reduce aliasing ("jaggies") when rendering on small displays, the
+// decoder can smooth each line of 8-bit grayscale pixels just before it is
+// delivered through the PNGDRAW callback. The smoothing radius is passed to
+// decode() in bits 16..23 of the iOptions parameter, e.g.:
+//    png.decode(pUser, (2 << PNG_SMOOTH_RADIUS_SHIFT)); // radius = 2
+// A radius of 0 (the default) disables smoothing and the decoded output is
+// bit-for-bit identical to previous versions. Radii larger than
+// PNG_SMOOTH_MAX_RADIUS are rejected with PNG_INVALID_PARAMETER.
+// Smoothing is performed horizontally with a box window (truncated, and
+// therefore weakened, at the left/right edges) and vertically by blending
+// with the cached previous line (skipped on the first line). The decoded
+// pixel data itself is never modified; only the copy sent to the callback
+// is smoothed.
+//
+#ifndef PNG_SMOOTH_RADIUS_SHIFT
+#define PNG_SMOOTH_RADIUS_SHIFT 16
+#define PNG_SMOOTH_RADIUS_MASK 0xff
+#define PNG_SMOOTH_MAX_RADIUS 8
+// Largest line (in bytes) that can be smoothed; matches the largest
+// decodable line accepted by PNGParseInfo()
+#define PNG_SMOOTH_MAX_LINE ((PNG_MAX_BUFFERED_PIXELS - 32) / 2)
+#endif // PNG_SMOOTH_RADIUS_SHIFT
+//
 // Convert 8-bit grayscale into RGB565
 //
 static const uint16_t usGrayTo565[] = {0x0000,0x0000,0x0000,0x0000,0x0020,0x0020,0x0020,0x0020, // 0
@@ -799,6 +824,37 @@ PNG_STATIC int PNGInit(PNGIMAGE *pPNG)
     return PNGParseInfo(pPNG); // gather info for image
 } /* PNGInit() */
 //
+// Smooth one line of 8-bit grayscale pixels (decode-time smoothing option)
+// Horizontal: box filter of radius iRadius; the window is truncated at the
+// left/right edges so smoothing is weakened there.
+// Vertical: the result is blended with the cached previous line (pPrev)
+// using weights which scale with the radius; skipped on the first line.
+// The smoothed line is written into pScratch and a pointer to it is returned.
+//
+PNG_STATIC uint8_t * PNGSmoothLine(uint8_t *pCurr, uint8_t *pPrev, int iPitch, int iRadius, uint8_t *pScratch)
+{
+    int x, k, iSum, iCount, x0, x1;
+
+    for (x = 0; x < iPitch; x++) {
+        x0 = x - iRadius;
+        if (x0 < 0) x0 = 0; // truncated window: weaker smoothing at the edge
+        x1 = x + iRadius;
+        if (x1 >= iPitch) x1 = iPitch - 1;
+        iSum = 0;
+        for (k = x0; k <= x1; k++)
+            iSum += pCurr[k];
+        iCount = x1 - x0 + 1;
+        pScratch[x] = (uint8_t)((iSum + iCount/2) / iCount);
+    }
+    if (pPrev != NULL) { // blend with the cached previous line
+        int iTotal = 2 * iRadius + 1;
+        for (x = 0; x < iPitch; x++) {
+            pScratch[x] = (uint8_t)((pScratch[x] * (iRadius + 1) + pPrev[x] * iRadius + iTotal/2) / iTotal);
+        }
+    }
+    return pScratch;
+} /* PNGSmoothLine() */
+//
 // Decode the PNG file
 //
 // You must call open() before calling decode()
@@ -810,7 +866,9 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
     int err, y, iLen=0;
     int bDone, iOffset, iFileOffset, iBytesRead, iAvailable;
     int iMarker=0;
+    int iSmooth; // decode-time smoothing radius (0 = disabled)
     uint8_t *tmp, *pCurr, *pPrev;
+    uint8_t ucSmooth[PNG_SMOOTH_MAX_LINE]; // scratch line for smoothing
     z_stream d_stream; /* decompression stream */
     uint8_t *s = pPage->ucFileBuf;
     struct inflate_state *state;
@@ -819,6 +877,19 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
     if (pPage->pImage == NULL && pPage->pfnDraw == NULL) {
         pPage->iError = PNG_NO_BUFFER;
         return 0;
+    }
+    // The optional smoothing radius is passed in bits 16..23 of iOptions
+    iSmooth = (iOptions >> PNG_SMOOTH_RADIUS_SHIFT) & PNG_SMOOTH_RADIUS_MASK;
+    if (iSmooth > PNG_SMOOTH_MAX_RADIUS) { // invalid radius
+        pPage->iError = PNG_INVALID_PARAMETER;
+        return 1;
+    }
+    if (iSmooth && (pPage->pImage != NULL || pPage->ucBpp != 8 ||
+                    pPage->ucPixelType != PNG_PIXEL_GRAYSCALE)) {
+        // smoothing is only supported for 8-bit grayscale delivered
+        // line by line through the PNGDRAW callback
+        pPage->iError = PNG_UNSUPPORTED_FEATURE;
+        return 1;
     }
     // Use internal buffer to maintain the current and previous lines
     y = (int)(intptr_t)&pPage->ucPixels[0];
@@ -982,6 +1053,11 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                                 pngd.iHasAlpha = pPage->iHasAlpha;
                                 pngd.iBpp = pPage->ucBpp;
                                 pngd.y = y;
+                                if (iSmooth) { // smooth the line before the callback
+                                    // pPrev+1 holds the cached previous line
+                                    pngd.pPixels = PNGSmoothLine(pCurr+1, (y > 0) ? pPrev+1 : NULL,
+                                                                 pPage->iPitch, iSmooth, ucSmooth);
+                                }
                                 if (!(*pPage->pfnDraw)(&pngd)) {
                                     pPage->iError = PNG_QUIT_EARLY;
                                     bDone = TRUE;
