@@ -1053,3 +1053,405 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
     err = inflateEnd(&d_stream);
     return pPage->iError;
 } /* DecodePNG() */
+//
+// Post-decode display enhancement pipeline
+// ----------------------------------------
+// Three stages are applied to each decoded RGB565 line in a single streaming
+// pass (no second traversal of the whole image):
+//   1. gamma correction      - 256-entry LUT (integer only, no libm)
+//   2. contrast stretch      - 256-entry LUT built from low/high clip points
+//   3. mild sharpening       - 3x3 unsharp mask using two line buffers
+//
+// The pipeline is opt-in: existing decode/getLineAsRGB565 behaviour is not
+// changed. Call PNGPostInit() once, then PNGPostLineRGB565() from the draw
+// callback for every line, in increasing y order. Input and output are
+// logical RGB565 words (RRRRRGGGGGGBBBBB), i.e. what getLineAsRGB565()
+// produces with PNG_RGB565_LITTLE_ENDIAN.
+//
+// All scratch memory is supplied by the caller (the library still performs
+// no malloc/free). Use PNGPostBufferSize() to size it.
+//
+// Consumer usage (declarations live at the bottom of this file; including
+// PNGdec.cpp, as the repository's own tests do, makes them visible):
+//   static PNGPOST post;
+//   uint8_t linebuf[?];  // PNGPostBufferSize(width) bytes
+//   PNGPostInit(&post, width, gammaQ8, lo, hi, sharpenQ8, linebuf, sizeof(linebuf));
+//   PNGPostLineRGB565(&post, rgb565Line, outLine, width, pDraw->y);
+//
+#define PNGPOST_GAMMA_MIN      64   // 0.25 in Q8
+#define PNGPOST_GAMMA_MAX    1024   // 4.00 in Q8
+#define PNGPOST_SHARPEN_MAX   128   // 0.50 in Q8 (mild)
+#define PNGPOST_CONTRAST_SPAN   8   // minimum high-low distance
+#define PNGPOST_STAGE_GAMMA      1
+#define PNGPOST_STAGE_CONTRAST   2
+#define PNGPOST_STAGE_SHARPEN    4
+
+// The pipeline API has external linkage so that a consumer translation unit
+// can declare and call it without this header-style file being included
+// twice (this file already reaches the build through PNGdec.cpp). See the
+// block comment above for the calling convention.
+
+// log2(x) in Q16 for x >= 1, fractional part interpolated from 33 entries
+static const uint32_t usPNGPostLogTab[33] = {
+       0,  2909,  5732,  8473, 11136, 13727, 16248, 18704,
+   21098, 23433, 25711, 27936, 30109, 32234, 34312, 36346,
+   38336, 40286, 42196, 44068, 45904, 47705, 49472, 51207,
+   52911, 54584, 56229, 57845, 59434, 60997, 62534, 64047,
+   65536};
+
+// 2^(-x) in Q16 for x in [0,1], same interpolation
+static const uint32_t usPNGPostExpTab[33] = {
+   65536, 64132, 62757, 61413, 60097, 58809, 57549, 56316,
+   55109, 53928, 52773, 51642, 50535, 49452, 48393, 47356,
+   46341, 45348, 44376, 43425, 42495, 41584, 40693, 39821,
+   38968, 38133, 37316, 36516, 35734, 34968, 34219, 33486,
+   32768};
+
+//
+// State for the post-processing pipeline. Kept in caller-provided memory so
+// that this file introduces no static RAM usage and no allocator calls.
+//
+typedef struct png_post_tag
+{
+    int iWidth;             // pixels per line
+    int iGammaQ8;           // gamma * 256
+    int iContrastLow;       // black clip point (0..254)
+    int iContrastHigh;      // white clip point (1..255), > low + 7
+    int iSharpenQ8;         // amount * 256 (0..128)
+    int iStageMask;         // PNGPOST_STAGE_* bits, default all three
+    uint8_t ucGammaLUT[256];    // stage 1: 8-bit in -> 8-bit out
+    uint8_t ucContrastLUT[256]; // stage 2: 8-bit in -> 8-bit out
+    uint8_t *pPrevRGB;      // width*3 bytes, stage-2 output of row y-1
+    uint8_t *pCurrRGB;      // width*3 bytes, stage-2 output of row y
+    int iHavePrev;          // pPrevRGB holds the row before iLastY
+    int iLastY;             // last row passed to the line function
+    int iTraceY;            // row to capture for diagnostics (-1 = none)
+    int iTraceX[3];         // three x positions to capture (-1 = unused)
+    uint8_t ucTrace[3][3][3]; // [pixel][stage 0..2][R,G,B]
+} PNGPOST;
+
+//
+// Return the number of bytes the caller must provide for the line buffers,
+// or 0 for an invalid width.
+//
+int PNGPostBufferSize(int iWidth)
+{
+    if (iWidth <= 0 || iWidth > PNG_MAX_BUFFERED_PIXELS / 4)
+        return 0;
+    return (iWidth * 3 * 2) + 16; // two RGB888 line buffers, aligned
+} /* PNGPostBufferSize() */
+
+//
+// Integer log2 in Q16 (no floating point)
+//
+uint32_t PNGPostLog2Q16(uint32_t u32Val)
+{
+    int iMSB = 0;
+    uint32_t u32M, u32Frac, u32Base;
+    uint32_t u32Temp = u32Val;
+
+    while (u32Temp > 1) {
+        u32Temp >>= 1;
+        iMSB++;
+    }
+    if (iMSB <= 16)
+        u32M = u32Val << (16 - iMSB);
+    else
+        u32M = u32Val >> (iMSB - 16);
+    u32Frac = u32M - 65536; // 0..65535
+    u32Base = usPNGPostLogTab[u32Frac >> 11];
+    u32Base += (((int32_t)(usPNGPostLogTab[(u32Frac >> 11) + 1] - usPNGPostLogTab[u32Frac >> 11])
+               * (int32_t)(u32Frac & 0x7ff)) >> 11);
+    return ((uint32_t)iMSB << 16) + u32Base;
+} /* PNGPostLog2Q16() */
+
+//
+// Return 255 * 2^e, e <= 0 (Q16 exponent), rounded and clamped to 0..255
+//
+int PNGPostExp255(int32_t iExp)
+{
+    uint32_t u32Ne, u32Frac, u32U;
+    int iN, iIdx;
+
+    u32Ne = (uint32_t)(-iExp);
+    iN = (int)(u32Ne >> 16);
+    if (iN > 8) // result would round to zero
+        return 0;
+    u32Frac = u32Ne & 0xffff;
+    iIdx = (int)(u32Frac >> 11);
+    u32U = usPNGPostExpTab[iIdx];
+    u32U += (((int32_t)(usPNGPostExpTab[iIdx + 1] - usPNGPostExpTab[iIdx])
+            * (int32_t)(u32Frac & 0x7ff)) >> 11);
+    u32U = (255u * u32U) >> iN; // Q16 value scaled by 2^-n
+    return (int)((u32U + 32768) >> 16);
+} /* PNGPostExp255() */
+
+//
+// Configure the pipeline. Returns PNG_SUCCESS or PNG_INVALID_PARAMETER when
+// any argument is out of range (or a required buffer is too small).
+//
+int PNGPostInit(PNGPOST *pPost, int iWidth, int iGammaQ8,
+                           int iContrastLow, int iContrastHigh, int iSharpenQ8,
+                           uint8_t *pBuffer, int iBufferSize)
+{
+    int i, iSpan;
+    int32_t iLog255;
+
+    if (pPost == NULL || pBuffer == NULL)
+        return PNG_INVALID_PARAMETER;
+    if (iWidth <= 0 || iWidth > PNG_MAX_BUFFERED_PIXELS / 4)
+        return PNG_INVALID_PARAMETER;
+    if (iGammaQ8 < PNGPOST_GAMMA_MIN || iGammaQ8 > PNGPOST_GAMMA_MAX)
+        return PNG_INVALID_PARAMETER;
+    if (iContrastLow < 0 || iContrastLow > 254)
+        return PNG_INVALID_PARAMETER;
+    if (iContrastHigh < 1 || iContrastHigh > 255)
+        return PNG_INVALID_PARAMETER;
+    if (iContrastHigh - iContrastLow < PNGPOST_CONTRAST_SPAN)
+        return PNG_INVALID_PARAMETER;
+    if (iSharpenQ8 < 0 || iSharpenQ8 > PNGPOST_SHARPEN_MAX)
+        return PNG_INVALID_PARAMETER;
+    if (iBufferSize < PNGPostBufferSize(iWidth))
+        return PNG_INVALID_PARAMETER;
+
+    memset(pPost, 0, sizeof(PNGPOST));
+    pPost->iWidth = iWidth;
+    pPost->iGammaQ8 = iGammaQ8;
+    pPost->iContrastLow = iContrastLow;
+    pPost->iContrastHigh = iContrastHigh;
+    pPost->iSharpenQ8 = iSharpenQ8;
+    pPost->iStageMask = PNGPOST_STAGE_GAMMA | PNGPOST_STAGE_CONTRAST | PNGPOST_STAGE_SHARPEN;
+    pPost->pPrevRGB = pBuffer;
+    pPost->pCurrRGB = pBuffer + (iWidth * 3);
+    pPost->iLastY = -1;
+    pPost->iTraceY = -1;
+    pPost->iTraceX[0] = pPost->iTraceX[1] = pPost->iTraceX[2] = -1;
+
+    // Stage 1: out = 255 * (in/255)^(gamma)
+    iLog255 = (int32_t)PNGPostLog2Q16(255);
+    pPost->ucGammaLUT[0] = 0;
+    pPost->ucGammaLUT[255] = 255;
+    for (i = 1; i < 255; i++) {
+        int32_t iExp = (int32_t)(((int64_t)((int32_t)PNGPostLog2Q16((uint32_t)i) - iLog255) * iGammaQ8) >> 8);
+        int iVal = PNGPostExp255(iExp);
+        if (iVal < pPost->ucGammaLUT[i - 1]) // keep the curve monotonic
+            iVal = pPost->ucGammaLUT[i - 1];
+        pPost->ucGammaLUT[i] = (uint8_t)iVal;
+    }
+
+    // Stage 2: linear stretch/clip, out = (in-low)*255/(high-low)
+    iSpan = iContrastHigh - iContrastLow;
+    for (i = 0; i < 256; i++) {
+        int iVal = ((i - iContrastLow) * 255 + (iSpan / 2)) / iSpan;
+        if (iVal < 0) iVal = 0;
+        else if (iVal > 255) iVal = 255;
+        pPost->ucContrastLUT[i] = (uint8_t)iVal;
+    }
+    return PNG_SUCCESS;
+} /* PNGPostInit() */
+
+//
+// Forget the previous line (call before starting a new image)
+//
+void PNGPostReset(PNGPOST *pPost)
+{
+    if (pPost == NULL)
+        return;
+    pPost->iHavePrev = 0;
+    pPost->iLastY = -1;
+} /* PNGPostReset() */
+
+//
+// Ask the pipeline to record the per-stage RGB output of three pixels on row
+// iY. Out-of-range positions are rejected.
+//
+int PNGPostSetTrace(PNGPOST *pPost, int iY, int iX0, int iX1, int iX2)
+{
+    if (pPost == NULL || iY < 0)
+        return PNG_INVALID_PARAMETER;
+    if (iX0 < 0 || iX0 >= pPost->iWidth || iX1 < 0 || iX1 >= pPost->iWidth ||
+        iX2 < 0 || iX2 >= pPost->iWidth)
+        return PNG_INVALID_PARAMETER;
+    pPost->iTraceY = iY;
+    pPost->iTraceX[0] = iX0;
+    pPost->iTraceX[1] = iX1;
+    pPost->iTraceX[2] = iX2;
+    memset(pPost->ucTrace, 0, sizeof(pPost->ucTrace));
+    return PNG_SUCCESS;
+} /* PNGPostSetTrace() */
+
+//
+// Select which stages run (default: all). Returns PNG_INVALID_PARAMETER for
+// any bit outside 0..7. Disabling a stage passes pixels through unchanged.
+//
+int PNGPostSetStageMask(PNGPOST *pPost, int iMask)
+{
+    if (pPost == NULL || iMask < 0 || iMask > 7)
+        return PNG_INVALID_PARAMETER;
+    pPost->iStageMask = iMask;
+    return PNG_SUCCESS;
+} /* PNGPostSetStageMask() */
+
+//
+// Read back one traced pixel: iIndex 0..2, iStage 0=gamma, 1=contrast,
+// 2=sharpen. pRGB receives three 8-bit channel values.
+//
+int PNGPostGetTrace(PNGPOST *pPost, int iIndex, int iStage, uint8_t *pRGB)
+{
+    if (pPost == NULL || pRGB == NULL || iIndex < 0 || iIndex > 2 ||
+        iStage < 0 || iStage > 2)
+        return PNG_INVALID_PARAMETER;
+    if (pPost->iTraceX[iIndex] < 0)
+        return PNG_INVALID_PARAMETER;
+    pRGB[0] = pPost->ucTrace[iIndex][iStage][0];
+    pRGB[1] = pPost->ucTrace[iIndex][iStage][1];
+    pRGB[2] = pPost->ucTrace[iIndex][iStage][2];
+    return PNG_SUCCESS;
+} /* PNGPostGetTrace() */
+
+//
+// Process one RGB565 line through gamma -> contrast -> sharpen.
+// pStage1/pStage2/pStage3 may be NULL; when supplied they receive the
+// intermediate RGB565 results (pStage3 is required). Each line is walked
+// exactly once: the LUT stages and the sharpener are fused into one loop
+// that keeps a two-pixel stage-2 lookahead in registers.
+// Returns PNG_SUCCESS or PNG_INVALID_PARAMETER.
+//
+// The sharpener is a separable 3x3 unsharp mask. The vertical blur reuses the
+// previous line's stage-2 pixels (stored in pPrevRGB) instead of buffering a
+// future line. On the first row the vertical tap degenerates to the current
+// row, and at the left/right edge the horizontal tap is clamped, which keeps
+// the constant border extension from darkening the frame.
+//
+int PNGPostLineRGB565Stages(PNGPOST *pPost, const uint16_t *pSrc,
+        uint16_t *pStage1, uint16_t *pStage2, uint16_t *pStage3,
+        int iWidth, int iY)
+{
+    int x, c, t;
+    uint8_t *pPrev, *pCurr, *pTop;
+    int bUsePrev, bTrace, bGamma, bContrast, bSharpen;
+    int v0[3], v1[3], v2[3]; // stage-2 RGB of pixels x-1, x, x+1
+    int iComputed;
+
+    if (pPost == NULL || pSrc == NULL || pStage3 == NULL)
+        return PNG_INVALID_PARAMETER;
+    if (iWidth != pPost->iWidth || iY < 0)
+        return PNG_INVALID_PARAMETER;
+
+    pPrev = pPost->pPrevRGB;
+    pCurr = pPost->pCurrRGB;
+    // Only use the stored line if it really is the row immediately above
+    bUsePrev = (pPost->iHavePrev && iY == pPost->iLastY + 1);
+    pTop = bUsePrev ? pPrev : pCurr;
+    bTrace = (iY == pPost->iTraceY);
+    bGamma = (pPost->iStageMask & PNGPOST_STAGE_GAMMA) != 0;
+    bContrast = (pPost->iStageMask & PNGPOST_STAGE_CONTRAST) != 0;
+    bSharpen = (pPost->iStageMask & PNGPOST_STAGE_SHARPEN) != 0;
+
+    // Run the two LUT stages for pixel x and record its stage-2 RGB
+    #define PNGPOST_STAGE2(pX, pRGB) do { \
+        uint16_t usPix_ = pSrc[pX]; \
+        int r5_ = (usPix_ >> 11) & 0x1f; \
+        int g6_ = (usPix_ >> 5) & 0x3f; \
+        int b5_ = usPix_ & 0x1f; \
+        int r8_ = (r5_ << 3) | (r5_ >> 2); /* 5 -> 8 bits */ \
+        int g8_ = (g6_ << 2) | (g6_ >> 4); /* 6 -> 8 bits */ \
+        int b8_ = (b5_ << 3) | (b5_ >> 2); \
+        int r1_ = (bGamma) ? (int)pPost->ucGammaLUT[r8_] : r8_; \
+        int g1_ = (bGamma) ? (int)pPost->ucGammaLUT[g8_] : g8_; \
+        int b1_ = (bGamma) ? (int)pPost->ucGammaLUT[b8_] : b8_; \
+        int r2_ = (bContrast) ? (int)pPost->ucContrastLUT[r1_] : r1_; \
+        int g2_ = (bContrast) ? (int)pPost->ucContrastLUT[g1_] : g1_; \
+        int b2_ = (bContrast) ? (int)pPost->ucContrastLUT[b1_] : b1_; \
+        pCurr[(pX)*3+0] = (uint8_t)r2_; \
+        pCurr[(pX)*3+1] = (uint8_t)g2_; \
+        pCurr[(pX)*3+2] = (uint8_t)b2_; \
+        if (pStage1 != NULL) pStage1[pX] = (uint16_t)(((r1_ & 0xf8) << 8) | ((g1_ & 0xfc) << 3) | (b1_ >> 3)); \
+        if (pStage2 != NULL) pStage2[pX] = (uint16_t)(((r2_ & 0xf8) << 8) | ((g2_ & 0xfc) << 3) | (b2_ >> 3)); \
+        if (bTrace) { \
+            for (t = 0; t < 3; t++) { \
+                if ((pX) == pPost->iTraceX[t]) { \
+                    pPost->ucTrace[t][0][0] = (uint8_t)r1_; \
+                    pPost->ucTrace[t][0][1] = (uint8_t)g1_; \
+                    pPost->ucTrace[t][0][2] = (uint8_t)b1_; \
+                    pPost->ucTrace[t][1][0] = (uint8_t)r2_; \
+                    pPost->ucTrace[t][1][1] = (uint8_t)g2_; \
+                    pPost->ucTrace[t][1][2] = (uint8_t)b2_; \
+                } \
+            } \
+        } \
+        (pRGB)[0] = r2_; (pRGB)[1] = g2_; (pRGB)[2] = b2_; \
+    } while (0)
+
+    // Prime the window: pixel 0 serves as its own left neighbour (edge clamp)
+    PNGPOST_STAGE2(0, v1);
+    v0[0] = v1[0]; v0[1] = v1[1]; v0[2] = v1[2];
+    iComputed = 0;
+    if (iWidth > 1) {
+        PNGPOST_STAGE2(1, v2);
+        iComputed = 1;
+    } else {
+        v2[0] = v1[0]; v2[1] = v1[1]; v2[2] = v1[2];
+    }
+
+    for (x = 0; x < iWidth; x++) {
+        int xm = (x > 0) ? (x - 1) : 0;
+        int xp = (x + 1 < iWidth) ? (x + 1) : (iWidth - 1);
+        int out[3];
+
+        if (bSharpen) {
+            for (c = 0; c < 3; c++) {
+                int topM = pTop[xm*3+c], top0 = pTop[x*3+c];
+                int topP = pTop[xp*3+c];
+                int vm = (topM + 3 * v0[c] + 2) >> 2;
+                int v0c = (top0 + 3 * v1[c] + 2) >> 2;
+                int vp = (topP + 3 * v2[c] + 2) >> 2;
+                int iBlur = (vm + 2 * v0c + vp + 2) >> 2;
+                int iVal = v1[c] + (((v1[c] - iBlur) * pPost->iSharpenQ8 + 128) >> 8);
+                if (iVal < 0) iVal = 0;
+                else if (iVal > 255) iVal = 255;
+                out[c] = iVal;
+            }
+        } else {
+            out[0] = v1[0]; out[1] = v1[1]; out[2] = v1[2];
+        }
+        pStage3[x] = (uint16_t)(((out[0] & 0xf8) << 8) | ((out[1] & 0xfc) << 3) | (out[2] >> 3));
+
+        if (bTrace) {
+            for (t = 0; t < 3; t++) {
+                if (x == pPost->iTraceX[t]) {
+                    pPost->ucTrace[t][2][0] = (uint8_t)out[0];
+                    pPost->ucTrace[t][2][1] = (uint8_t)out[1];
+                    pPost->ucTrace[t][2][2] = (uint8_t)out[2];
+                }
+            }
+        }
+        // Slide the window one pixel to the right
+        v0[0] = v1[0]; v0[1] = v1[1]; v0[2] = v1[2];
+        v1[0] = v2[0]; v1[1] = v2[1]; v1[2] = v2[2];
+        if (x + 2 <= iWidth - 1 && iComputed < x + 2) {
+            PNGPOST_STAGE2(x + 2, v2);
+            iComputed = x + 2;
+        } else {
+            v2[0] = v1[0]; v2[1] = v1[1]; v2[2] = v1[2]; // edge clamp
+        }
+    } // for x
+    #undef PNGPOST_STAGE2
+
+    // The current stage-2 line becomes the previous line for the next call
+    pPost->pPrevRGB = pCurr;
+    pPost->pCurrRGB = pPrev;
+    pPost->iHavePrev = 1;
+    pPost->iLastY = iY;
+    return PNG_SUCCESS;
+} /* PNGPostLineRGB565Stages() */
+
+//
+// Convenience wrapper for the normal display path (final result only)
+//
+int PNGPostLineRGB565(PNGPOST *pPost, const uint16_t *pSrc,
+                                 uint16_t *pDst, int iWidth, int iY)
+{
+    return PNGPostLineRGB565Stages(pPost, pSrc, NULL, NULL, pDst, iWidth, iY);
+} /* PNGPostLineRGB565() */
+
