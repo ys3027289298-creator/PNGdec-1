@@ -1053,3 +1053,652 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
     err = inflateEnd(&d_stream);
     return pPage->iError;
 } /* DecodePNG() */
+//
+// ---------------------------------------------------------------------------
+// Pull-mode (caller-paced) decoding
+// ---------------------------------------------------------------------------
+// The classic DecodePNG() path above pushes through the whole file using the
+// read/seek callbacks stored in PNGIMAGE. This second entry point turns the
+// flow around: the decoder asks the caller for the next block whenever it
+// needs bytes. The caller may hand back a short block, or 0 bytes meaning
+// "nothing right now"; in that case PNGPullDecode() returns PNG_PULL_PAUSED
+// with all of its state saved and can be called again later to resume at
+// exactly the same point.
+//
+// The implementation is a resumable state machine over the PNG chunk stream.
+// It feeds zlib, de-filters and delivers lines in exactly the same order as
+// DecodePNG(), so the one-shot path and its pixel output are untouched. This
+// block only adds new symbols; no existing declaration or signature changes.
+//
+// Typical use:
+//   static PNGIMAGE img;
+//   static PNGPULLSTATE st;
+//   PNGPullInit(&img, &st, PullCB, pSource, DrawCB, 64, 4);
+//   img.pImage = pFrameBuffer;         // or leave NULL and use DrawCB
+//   do {
+//       rc = PNGPullDecode(&img, &st, pDrawUser, 0);
+//   } while (rc == PNG_PULL_PAUSED);
+//
+// Pull callback contract (PNG_PULL_CALLBACK):
+//   > 0 : number of bytes copied to pBuffer, never more than iMaxLen
+//         (returning fewer bytes than asked is fine)
+//   == 0: no data available at the moment; the decoder pauses
+//   < 0 : end of input / source failure; decode fails with PNG_DECODE_ERROR
+//
+// PNGPullDecode() returns:
+//   PNG_SUCCESS           image complete
+//   PNG_PULL_PAUSED       source returned 0 bytes; call again to resume
+//   PNG_DECODE_ERROR      truncated or corrupt stream (e.g. source ended early)
+//   PNG_QUIT_EARLY        the draw callback returned 0
+//   PNG_NO_BUFFER         neither an image buffer nor a draw callback was set
+//   PNG_PULL_PAUSE_LIMIT  more than iMaxPauses consecutive empty replies
+//   PNG_PULL_BAD_BLOCK    the callback returned more bytes than requested
+//   PNG_PULL_INVALID_STATE the API was used out of order (or state is invalid)
+//
+// iBlockSize is the largest block requested per callback (1..PNG_FILE_BUF_SIZE).
+// iMaxPauses is the maximum number of consecutive 0-byte replies tolerated;
+// 0 means unlimited.
+//
+// The PNGPULLSTATE (and PNGIMAGE) must outlive the decode and must not be
+// copied: it owns the 32K zlib window and the pointers into its own buffers.
+//
+#define PNG_PULL_MAGIC          0x504e4750u /* 'PNGP' */
+#define PNG_PULL_PAUSED         1
+#define PNG_PULL_INVALID_STATE  20
+#define PNG_PULL_BAD_BLOCK      21
+#define PNG_PULL_PAUSE_LIMIT    22
+
+typedef int32_t (PNG_PULL_CALLBACK)(void *pUser, uint8_t *pBuffer, int32_t iMaxLen);
+
+// internal phases of the resumable chunk parser
+enum {
+    PNG_PULL_PHASE_SIGNATURE = 0,
+    PNG_PULL_PHASE_CHUNK_HEADER,
+    PNG_PULL_PHASE_CHUNK_DATA,
+    PNG_PULL_PHASE_IDAT,
+    PNG_PULL_PHASE_SKIP,
+    PNG_PULL_PHASE_CRC,
+    PNG_PULL_PHASE_DONE,
+    PNG_PULL_PHASE_ERROR
+};
+
+typedef struct png_pull_state_tag
+{
+    uint32_t u32Magic;              // set by PNGPullInit()
+    PNGIMAGE *pImage;               // image this state belongs to
+    PNG_PULL_CALLBACK *pfnPull;     // source callback
+    void *pUser;                    // source user pointer
+    int iPhase;                     // PNG_PULL_PHASE_*
+    int iError;                     // last error (PNG_* or PNG_PULL_*)
+    int iBlockSize;                 // largest block per callback
+    int iMaxPauses;                 // consecutive empty replies allowed (0 = any)
+    int iPauseStreak;               // consecutive empty replies so far
+    int iCallbackCount;             // total source callback invocations
+    int iPauseCount;                // total empty replies seen
+    int iBytesPulled;               // total bytes obtained from the source
+    int iOptions;                   // decode options for this run
+    int bHeaderDone;                // IHDR parsed
+    int bZlibReady;                 // inflate initialized
+    int32_t iChunkType;             // current chunk type
+    int32_t iChunkLength;           // current chunk declared length
+    int iChunkRemaining;            // data bytes left in the current chunk
+    int iCrcRemaining;              // CRC bytes left to skip for the chunk
+    int iLine;                      // lines delivered so far
+    z_stream d_stream;              // persistent zlib stream
+    uint8_t ucZLIB[32768 + sizeof(struct inflate_state)]; // 32K window + state
+    uint8_t ucFileBuf[PNG_FILE_BUF_SIZE]; // staging buffer for pulled bytes
+    int iBufPos;                    // read offset inside ucFileBuf
+    int iBufLen;                    // valid bytes in ucFileBuf
+    uint8_t *pCurr;                 // current de-filter line (pitch+1 bytes)
+    uint8_t *pPrev;                 // previous de-filter line (pitch+1 bytes)
+} PNGPULLSTATE;
+
+//
+// Refill / reposition helpers for the staging buffer
+//
+static void PNGPullCompact(PNGPULLSTATE *pSt)
+{
+    int iAvail = pSt->iBufLen - pSt->iBufPos;
+
+    if (pSt->iBufPos > 0) {
+        if (iAvail > 0)
+            memmove(pSt->ucFileBuf, &pSt->ucFileBuf[pSt->iBufPos], iAvail);
+        pSt->iBufPos = 0;
+        pSt->iBufLen = iAvail;
+    }
+} /* PNGPullCompact() */
+
+//
+// Make sure at least iNeed bytes are contiguous in ucFileBuf.
+// Returns PNG_SUCCESS, PNG_PULL_PAUSED or a PNG error code.
+//
+static int PNGPullNeed(PNGPULLSTATE *pSt, int iNeed)
+{
+    if (iNeed <= 0)
+        return PNG_SUCCESS;
+    if (iNeed > PNG_FILE_BUF_SIZE)
+        return PNG_INVALID_PARAMETER;
+    for (;;) {
+        int iAvail, iWant, iRoom;
+        int32_t iGot;
+
+        if (pSt->iBufPos > 0)
+            PNGPullCompact(pSt);
+        iAvail = pSt->iBufLen - pSt->iBufPos;
+        if (iAvail >= iNeed)
+            return PNG_SUCCESS;
+        iRoom = PNG_FILE_BUF_SIZE - pSt->iBufLen;
+        if (iRoom <= 0) { // request cannot fit: treat as malformed input
+            pSt->iError = PNG_DECODE_ERROR;
+            return PNG_DECODE_ERROR;
+        }
+        iWant = pSt->iBlockSize;
+        if (iWant > iRoom)
+            iWant = iRoom;
+        iGot = (*pSt->pfnPull)(pSt->pUser, &pSt->ucFileBuf[pSt->iBufLen], iWant);
+        pSt->iCallbackCount++;
+        if (iGot > iWant) { // callback violated the block contract
+            pSt->iError = PNG_PULL_BAD_BLOCK;
+            return PNG_PULL_BAD_BLOCK;
+        }
+        if (iGot < 0) { // source hit end of input
+            pSt->iError = PNG_DECODE_ERROR;
+            return PNG_DECODE_ERROR;
+        }
+        if (iGot == 0) {
+            pSt->iPauseCount++;
+            pSt->iPauseStreak++;
+            if (pSt->iMaxPauses > 0 && pSt->iPauseStreak > pSt->iMaxPauses) {
+                pSt->iError = PNG_PULL_PAUSE_LIMIT;
+                return PNG_PULL_PAUSE_LIMIT;
+            }
+            return PNG_PULL_PAUSED;
+        }
+        pSt->iPauseStreak = 0;
+        pSt->iBufLen += (int)iGot;
+        pSt->iBytesPulled += (int)iGot;
+    }
+} /* PNGPullNeed() */
+
+//
+// Consume up to *piRemaining bytes from the staging buffer, pulling more
+// when needed. Partial progress is recorded in *piRemaining, so the operation
+// can be suspended and resumed at any byte boundary.
+//
+static int PNGPullConsume(PNGPULLSTATE *pSt, int *piRemaining)
+{
+    while (*piRemaining > 0) {
+        int iAvail = pSt->iBufLen - pSt->iBufPos;
+        int rc, iTake;
+
+        if (iAvail == 0) {
+            rc = PNGPullNeed(pSt, 1);
+            if (rc != PNG_SUCCESS)
+                return rc;
+            iAvail = pSt->iBufLen - pSt->iBufPos;
+        }
+        iTake = (iAvail < *piRemaining) ? iAvail : *piRemaining;
+        pSt->iBufPos += iTake;
+        *piRemaining -= iTake;
+    }
+    return PNG_SUCCESS;
+} /* PNGPullConsume() */
+
+//
+// Validate IHDR and fill in the image geometry, mirroring PNGParseInfo()
+// s points to the 8-byte chunk header (length + 'IHDR'), followed by the
+// 13 bytes of data and the 4-byte CRC.
+//
+static int PNGPullParseIHDR(PNGIMAGE *pImage, uint8_t *s)
+{
+    int len = MOTOLONG(&s[0]);
+    int crc, hdrcrc;
+
+    if (MOTOLONG(&s[4]) != 0x49484452 /*'IHDR'*/ || len != 13)
+        return PNG_INVALID_FILE;
+    crc = (int)crc32(0, &s[4], 17);
+    hdrcrc = MOTOLONG(&s[8 + 13]);
+    if (crc != hdrcrc)
+        return PNG_INVALID_FILE;
+    pImage->iWidth = MOTOLONG(&s[8]);
+    pImage->iHeight = MOTOLONG(&s[12]);
+    if (pImage->iWidth <= 0 || pImage->iHeight <= 0 ||
+        pImage->iWidth > PNG_MAX_BUFFERED_PIXELS / 4)
+        return PNG_TOO_BIG;
+    pImage->ucBpp = s[16];
+    pImage->ucPixelType = s[17];
+    pImage->iInterlaced = s[20];
+    if (pImage->iInterlaced || pImage->ucBpp > 8)
+        return PNG_UNSUPPORTED_FEATURE;
+    if (pImage->ucPixelType != PNG_PIXEL_GRAYSCALE &&
+        pImage->ucPixelType != PNG_PIXEL_TRUECOLOR &&
+        pImage->ucPixelType != PNG_PIXEL_INDEXED &&
+        pImage->ucPixelType != PNG_PIXEL_GRAY_ALPHA &&
+        pImage->ucPixelType != PNG_PIXEL_TRUECOLOR_ALPHA)
+        return PNG_INVALID_FILE;
+    if (pImage->ucBpp == 0 || pImage->ucBpp == 3 ||
+        pImage->ucBpp == 5 || pImage->ucBpp == 6)
+        return PNG_INVALID_FILE;
+    switch (pImage->ucPixelType) {
+        case PNG_PIXEL_GRAYSCALE:
+        case PNG_PIXEL_INDEXED:
+            pImage->iPitch = (pImage->iWidth * pImage->ucBpp + 7) / 8;
+            break;
+        case PNG_PIXEL_TRUECOLOR:
+            pImage->iPitch = ((3 * pImage->ucBpp) * pImage->iWidth + 7) / 8;
+            break;
+        case PNG_PIXEL_GRAY_ALPHA:
+            pImage->iPitch = ((2 * pImage->ucBpp) * pImage->iWidth + 7) / 8;
+            pImage->iHasAlpha = 1;
+            break;
+        case PNG_PIXEL_TRUECOLOR_ALPHA:
+            pImage->iPitch = ((4 * pImage->ucBpp) * pImage->iWidth + 7) / 8;
+            pImage->iHasAlpha = 1;
+            break;
+    }
+    if ((pImage->iPitch + 1) * 2 + 32 > PNG_MAX_BUFFERED_PIXELS)
+        return PNG_TOO_BIG;
+    return PNG_SUCCESS;
+} /* PNGPullParseIHDR() */
+
+//
+// Initialize a pull-mode decode.
+// Returns PNG_SUCCESS or PNG_INVALID_PARAMETER for bad arguments.
+//
+int PNGPullInit(PNGIMAGE *pImage, PNGPULLSTATE *pSt,
+                PNG_PULL_CALLBACK *pfnPull, void *pUser,
+                PNG_DRAW_CALLBACK *pfnDraw, int iBlockSize, int iMaxPauses)
+{
+    if (pImage == NULL || pSt == NULL || pfnPull == NULL)
+        return PNG_INVALID_PARAMETER;
+    if (iBlockSize <= 0 || iBlockSize > PNG_FILE_BUF_SIZE || iMaxPauses < 0)
+        return PNG_INVALID_PARAMETER;
+    memset(pImage, 0, sizeof(PNGIMAGE));
+    memset(pSt, 0, sizeof(PNGPULLSTATE));
+    pSt->u32Magic = PNG_PULL_MAGIC;
+    pSt->pImage = pImage;
+    pSt->pfnPull = pfnPull;
+    pSt->pUser = pUser;
+    pSt->iBlockSize = iBlockSize;
+    pSt->iMaxPauses = iMaxPauses;
+    pSt->iPhase = PNG_PULL_PHASE_SIGNATURE;
+    pImage->pfnDraw = pfnDraw;
+    pImage->pfnOpen = NULL;
+    pImage->pfnClose = NULL;
+    pImage->pfnRead = NULL; // pull mode never uses the push-style callbacks
+    pImage->pfnSeek = NULL;
+    return PNG_SUCCESS;
+} /* PNGPullInit() */
+
+//
+// Adjust the block size / pause budget before (or between) decode calls
+//
+int PNGPullSetBlockSize(PNGPULLSTATE *pSt, int iBlockSize)
+{
+    if (pSt == NULL || pSt->u32Magic != PNG_PULL_MAGIC)
+        return PNG_PULL_INVALID_STATE;
+    if (iBlockSize <= 0 || iBlockSize > PNG_FILE_BUF_SIZE)
+        return PNG_INVALID_PARAMETER;
+    pSt->iBlockSize = iBlockSize;
+    return PNG_SUCCESS;
+} /* PNGPullSetBlockSize() */
+
+int PNGPullSetMaxPauses(PNGPULLSTATE *pSt, int iMaxPauses)
+{
+    if (pSt == NULL || pSt->u32Magic != PNG_PULL_MAGIC)
+        return PNG_PULL_INVALID_STATE;
+    if (iMaxPauses < 0)
+        return PNG_INVALID_PARAMETER;
+    pSt->iMaxPauses = iMaxPauses;
+    return PNG_SUCCESS;
+} /* PNGPullSetMaxPauses() */
+
+//
+// Counters for the last (or current) decode: source callbacks, empty replies
+// and total bytes obtained.
+//
+int PNGPullGetCounters(PNGPULLSTATE *pSt, int *pCalls, int *pPauses, int *pBytes)
+{
+    if (pSt == NULL || pSt->u32Magic != PNG_PULL_MAGIC)
+        return PNG_PULL_INVALID_STATE;
+    if (pCalls) *pCalls = pSt->iCallbackCount;
+    if (pPauses) *pPauses = pSt->iPauseCount;
+    if (pBytes) *pBytes = pSt->iBytesPulled;
+    return PNG_SUCCESS;
+} /* PNGPullGetCounters() */
+
+int PNGPullGetError(PNGPULLSTATE *pSt)
+{
+    if (pSt == NULL || pSt->u32Magic != PNG_PULL_MAGIC)
+        return PNG_PULL_INVALID_STATE;
+    return pSt->iError;
+} /* PNGPullGetError() */
+
+//
+// Feed one block of input to zlib and emit every complete line it produces.
+// Mirrors the inner loops of DecodePNG() so the output is identical.
+// Returns PNG_SUCCESS when the image is complete, PNG_PULL_PAUSED when the
+// source has no data, or a PNG error code.
+//
+static int PNGPullIDAT(PNGIMAGE *pImage, PNGPULLSTATE *pSt, void *pUser)
+{
+    z_stream *pStream = &pSt->d_stream;
+
+    for (;;) {
+        int rc, err, iConsumed;
+        uInt iBefore;
+
+        if (pStream->avail_in == 0) {
+            if (pSt->iChunkRemaining == 0)
+                return PNG_SUCCESS; // this IDAT chunk is exhausted
+            rc = PNGPullNeed(pSt, 1);
+            if (rc != PNG_SUCCESS)
+                return rc;
+            {
+                int iAvail = pSt->iBufLen - pSt->iBufPos;
+                if (iAvail > pSt->iChunkRemaining)
+                    iAvail = pSt->iChunkRemaining;
+                pStream->next_in = &pSt->ucFileBuf[pSt->iBufPos];
+                pStream->avail_in = (uInt)iAvail;
+            }
+        }
+        if (pStream->avail_out == 0) { // start a new line
+            pStream->avail_out = pImage->iPitch + 1;
+            pStream->next_out = pSt->pCurr;
+        }
+        iBefore = pStream->avail_in;
+        err = inflate(pStream, Z_NO_FLUSH, pSt->iOptions & PNG_CHECK_CRC);
+        iConsumed = (int)(iBefore - pStream->avail_in);
+        pSt->iBufPos += iConsumed;
+        pSt->iChunkRemaining -= iConsumed;
+
+        if ((err == Z_OK || err == Z_STREAM_END) && pStream->avail_out == 0) {
+            uint8_t *tmp;
+            DeFilter(pSt->pCurr, pSt->pPrev, pImage->iWidth, pImage->iPitch);
+            if (pImage->pImage == NULL) { // no image buffer, send it line by line
+                PNGDRAW pngd;
+                pngd.pUser = pUser;
+                pngd.iPitch = pImage->iPitch;
+                pngd.iWidth = pImage->iWidth;
+                pngd.pPalette = pImage->ucPalette;
+                pngd.pFastPalette = (pSt->iOptions & PNG_FAST_PALETTE) ?
+                    (uint16_t *)&pImage->ucPixels[sizeof(pImage->ucPixels) - 512] : NULL;
+                pngd.pPixels = pSt->pCurr + 1;
+                pngd.iPixelType = pImage->ucPixelType;
+                pngd.iHasAlpha = pImage->iHasAlpha;
+                pngd.iBpp = pImage->ucBpp;
+                pngd.y = pSt->iLine;
+                if (!(*pImage->pfnDraw)(&pngd)) {
+                    pSt->iError = PNG_QUIT_EARLY;
+                    pSt->iPhase = PNG_PULL_PHASE_ERROR;
+                    return PNG_QUIT_EARLY;
+                }
+            } else { // copy to the destination bitmap
+                memcpy(&pImage->pImage[pSt->iLine * pImage->iPitch],
+                       &pSt->pCurr[1], pImage->iPitch);
+            }
+            pSt->iLine++;
+            tmp = pSt->pCurr; pSt->pCurr = pSt->pPrev; pSt->pPrev = tmp;
+            if (pSt->iLine >= pImage->iHeight) { // complete image
+                pSt->iPhase = PNG_PULL_PHASE_DONE;
+                return PNG_SUCCESS;
+            }
+        }
+        if (err == Z_STREAM_END) {
+            // stream ended before all lines were produced
+            pSt->iError = PNG_DECODE_ERROR;
+            pSt->iPhase = PNG_PULL_PHASE_ERROR;
+            return PNG_DECODE_ERROR;
+        }
+        if (err == Z_DATA_ERROR || err == Z_STREAM_ERROR) {
+            pSt->iError = PNG_DECODE_ERROR;
+            pSt->iPhase = PNG_PULL_PHASE_ERROR;
+            return PNG_DECODE_ERROR;
+        }
+        if (err != Z_OK && err != Z_BUF_ERROR) { // Z_MEM_ERROR / Z_NEED_DICT
+            pSt->iError = PNG_DECODE_ERROR;
+            pSt->iPhase = PNG_PULL_PHASE_ERROR;
+            return PNG_DECODE_ERROR;
+        }
+        // Z_OK / Z_BUF_ERROR: keep feeding input or start the next line
+        if (pSt->iChunkRemaining == 0 && pStream->avail_in == 0)
+            return PNG_SUCCESS; // this IDAT chunk is finished
+    }
+} /* PNGPullIDAT() */
+
+//
+// Handle one complete non-IDAT chunk whose data is contiguous at s.
+// Mirrors the marker switch in DecodePNG().
+//
+static void PNGPullChunk(PNGIMAGE *pImage, PNGPULLSTATE *pSt, int32_t iMarker,
+                         uint8_t *s, int iLen)
+{
+    switch (iMarker) {
+        case 0x504c5445: //'PLTE'
+            memset(&pImage->ucPalette[768], 0xff, 256);
+            if (iLen > 0 && iLen <= 768)
+                memcpy(pImage->ucPalette, s, iLen);
+            if (pSt->iOptions & PNG_FAST_PALETTE) {
+                int i, iColors = 1 << pImage->ucBpp;
+                uint16_t usPixel, *d;
+                uint8_t *p = pImage->ucPalette;
+                d = (uint16_t *)&pImage->ucPixels[sizeof(pImage->ucPixels) - 512];
+                for (i = 0; i < iColors; i++) {
+                    usPixel = (p[2] >> 3);
+                    usPixel |= ((p[1] >> 2) << 5);
+                    usPixel |= ((p[0] >> 3) << 11);
+                    *d++ = usPixel;
+                    p += 3;
+                }
+            }
+            break;
+        case 0x74524e53: //'tRNS'
+            if (pImage->ucPixelType == PNG_PIXEL_INDEXED && iLen > 0 && iLen <= 256) {
+                memcpy(&pImage->ucPalette[768], s, iLen);
+                pImage->iHasAlpha = 1;
+            } else if (iLen == 2) {
+                pImage->iTransparent = s[1];
+                pImage->iHasAlpha = 1;
+            } else if (iLen == 6) {
+                pImage->iTransparent = s[5];
+                pImage->iTransparent |= (s[3] << 8);
+                pImage->iTransparent |= (s[1] << 16);
+                pImage->iHasAlpha = 1;
+            }
+            break;
+        case 0x74455874: //'tEXt'
+            if (iLen > 0) {
+                int i, iCopy;
+                char szTemp[64];
+                char *pDest = NULL;
+                memset(szTemp, 0, sizeof(szTemp));
+                iCopy = (iLen < (int)sizeof(szTemp) - 1) ? iLen : (int)sizeof(szTemp) - 1;
+                memcpy(szTemp, s, iCopy); // never read past the chunk data
+                i = (int)strlen(szTemp) + 1;
+                if (strcmp(szTemp, "Comment") == 0 || strcmp(szTemp, "Description") == 0)
+                    pDest = &pImage->szComment[0];
+                if (pDest != NULL && iLen > i) {
+                    if ((iLen - i) < PNG_COMMENT_SIZE) {
+                        memcpy(pImage->szComment, &s[i], iLen - i);
+                        pImage->szComment[iLen - i + 1] = 0;
+                    } else {
+                        memcpy(pImage->szComment, &s[i], PNG_COMMENT_SIZE - 1);
+                        pImage->szComment[PNG_COMMENT_SIZE - 1] = '\0';
+                    }
+                }
+            }
+            break;
+        default: // bKGD / gAMA / unknown chunks are ignored, like DecodePNG()
+            break;
+    }
+} /* PNGPullChunk() */
+
+//
+// Pull-mode decode. Call repeatedly until it no longer returns
+// PNG_PULL_PAUSED. The entire decoder state lives in pSt, so a pause at any
+// byte boundary is transparent to the caller.
+//
+int PNGPullDecode(PNGIMAGE *pImage, PNGPULLSTATE *pSt, void *pUser, int iOptions)
+{
+    if (pImage == NULL || pSt == NULL || pSt->u32Magic != PNG_PULL_MAGIC ||
+        pSt->pfnPull == NULL || pSt->pImage != pImage)
+        return PNG_PULL_INVALID_STATE;
+    if (pSt->iPhase == PNG_PULL_PHASE_ERROR)
+        return PNG_PULL_INVALID_STATE; // must re-init to decode again
+    if (pImage->pImage == NULL && pImage->pfnDraw == NULL) {
+        pImage->iError = PNG_NO_BUFFER;
+        return PNG_NO_BUFFER;
+    }
+    pSt->iOptions = iOptions;
+    if (pSt->iPhase == PNG_PULL_PHASE_DONE)
+        return PNG_PULL_INVALID_STATE; // must re-init to decode again
+
+    for (;;) {
+        int rc;
+
+        switch (pSt->iPhase) {
+        case PNG_PULL_PHASE_SIGNATURE:
+            rc = PNGPullNeed(pSt, 8);
+            if (rc != PNG_SUCCESS)
+                return rc;
+            if (MOTOLONG(&pSt->ucFileBuf[pSt->iBufPos]) != (int32_t)0x89504e47) {
+                pSt->iError = PNG_INVALID_FILE;
+                pSt->iPhase = PNG_PULL_PHASE_ERROR;
+                return PNG_INVALID_FILE;
+            }
+            pSt->iBufPos += 8;
+            pSt->iPhase = PNG_PULL_PHASE_CHUNK_HEADER;
+            break;
+
+        case PNG_PULL_PHASE_CHUNK_HEADER:
+        {
+            int len;
+            uint8_t *s;
+
+            rc = PNGPullNeed(pSt, 8);
+            if (rc != PNG_SUCCESS)
+                return rc;
+            s = &pSt->ucFileBuf[pSt->iBufPos];
+            len = MOTOLONG(s);
+            pSt->iChunkLength = len;
+            pSt->iChunkType = MOTOLONG(&s[4]);
+            if (len < 0 || len > 0x7ffffff0) { // malformed length
+                pSt->iError = PNG_DECODE_ERROR;
+                pSt->iPhase = PNG_PULL_PHASE_ERROR;
+                return PNG_DECODE_ERROR;
+            }
+            if (pSt->iChunkType == 0x49484452) { //'IHDR'
+                if (pSt->bHeaderDone || len != 13) {
+                    pSt->iError = PNG_INVALID_FILE;
+                    pSt->iPhase = PNG_PULL_PHASE_ERROR;
+                    return PNG_INVALID_FILE;
+                }
+                rc = PNGPullNeed(pSt, 8 + 13 + 4);
+                if (rc != PNG_SUCCESS)
+                    return rc;
+                rc = PNGPullParseIHDR(pImage, &pSt->ucFileBuf[pSt->iBufPos]);
+                if (rc != PNG_SUCCESS) {
+                    pSt->iError = rc;
+                    pSt->iPhase = PNG_PULL_PHASE_ERROR;
+                    return rc;
+                }
+                // set up the line buffers (same alignment rule as DecodePNG)
+                {
+                    int y = (int)(intptr_t)&pImage->ucPixels[0];
+                    y &= 15;
+                    y += (15 - y);
+                    pSt->pCurr = &pImage->ucPixels[y];
+                    y += pImage->iPitch + 1;
+                    y += (15 - (y & 15));
+                    pSt->pPrev = &pImage->ucPixels[y];
+                    pSt->d_stream.avail_out = 0;
+                    pSt->d_stream.next_out = pImage->pImage;
+                }
+                pSt->bHeaderDone = 1;
+                pSt->iBufPos += 8 + 13 + 4;
+                pSt->iPhase = PNG_PULL_PHASE_CHUNK_HEADER;
+                break;
+            }
+            if (!pSt->bHeaderDone) { // IHDR must be the first chunk
+                pSt->iError = PNG_INVALID_FILE;
+                pSt->iPhase = PNG_PULL_PHASE_ERROR;
+                return PNG_INVALID_FILE;
+            }
+            pSt->iBufPos += 8;
+            pSt->iChunkRemaining = len;
+            if (pSt->iChunkType == 0x49444154) { //'IDAT'
+                if (!pSt->bZlibReady) {
+                    struct inflate_state *state;
+                    // zlib state and window live inside the pull state, so no
+                    // malloc/free is performed (same trick as DecodePNG)
+                    memset(&pSt->d_stream, 0, sizeof(pSt->d_stream));
+                    state = (struct inflate_state FAR *)pSt->ucZLIB;
+                    pSt->d_stream.state = (struct internal_state FAR *)state;
+                    state->window = &pSt->ucZLIB[sizeof(struct inflate_state)];
+                    rc = inflateInit(&pSt->d_stream);
+                    if (rc != Z_OK) {
+                        pSt->iError = PNG_MEM_ERROR;
+                        pSt->iPhase = PNG_PULL_PHASE_ERROR;
+                        return PNG_MEM_ERROR;
+                    }
+                    pSt->d_stream.avail_out = 0;
+                    pSt->d_stream.next_out = pImage->pImage;
+                    pSt->bZlibReady = 1;
+                }
+                pSt->iPhase = PNG_PULL_PHASE_IDAT;
+            } else if (len == 0) {
+                pSt->iCrcRemaining = 4; pSt->iPhase = PNG_PULL_PHASE_CRC;
+            } else if (len <= PNG_FILE_BUF_SIZE) {
+                pSt->iPhase = PNG_PULL_PHASE_CHUNK_DATA;
+            } else { // ancillary chunk too large to buffer: discard it
+                pSt->iPhase = PNG_PULL_PHASE_SKIP;
+            }
+            break;
+        }
+
+        case PNG_PULL_PHASE_CHUNK_DATA:
+            rc = PNGPullNeed(pSt, pSt->iChunkRemaining);
+            if (rc != PNG_SUCCESS)
+                return rc;
+            PNGPullChunk(pImage, pSt, pSt->iChunkType,
+                         &pSt->ucFileBuf[pSt->iBufPos], pSt->iChunkRemaining);
+            pSt->iBufPos += pSt->iChunkRemaining;
+            pSt->iChunkRemaining = 0;
+            pSt->iCrcRemaining = 4; pSt->iPhase = PNG_PULL_PHASE_CRC;
+            break;
+
+        case PNG_PULL_PHASE_IDAT:
+            rc = PNGPullIDAT(pImage, pSt, pUser);
+            if (rc == PNG_PULL_PAUSED)
+                return rc;
+            if (rc != PNG_SUCCESS)
+                return rc;
+            if (pSt->iPhase == PNG_PULL_PHASE_DONE)
+                return PNG_SUCCESS;
+            if (pSt->iChunkRemaining == 0) { // chunk done, skip its CRC
+                pSt->iCrcRemaining = 4;
+                pSt->iPhase = PNG_PULL_PHASE_CRC;
+            }
+            break;
+
+        case PNG_PULL_PHASE_SKIP:
+            rc = PNGPullConsume(pSt, &pSt->iChunkRemaining);
+            if (rc != PNG_SUCCESS)
+                return rc;
+            pSt->iCrcRemaining = 4; pSt->iPhase = PNG_PULL_PHASE_CRC;
+            break;
+
+        case PNG_PULL_PHASE_CRC:
+            rc = PNGPullConsume(pSt, &pSt->iCrcRemaining);
+            if (rc != PNG_SUCCESS)
+                return rc;
+            pSt->iPhase = PNG_PULL_PHASE_CHUNK_HEADER;
+            break;
+
+        default: // unreachable
+            pSt->iPhase = PNG_PULL_PHASE_ERROR;
+            pSt->iError = PNG_PULL_INVALID_STATE;
+            return PNG_PULL_INVALID_STATE;
+        }
+    }
+} /* PNGPullDecode() */
