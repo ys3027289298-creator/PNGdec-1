@@ -64,6 +64,7 @@ static const uint16_t usGrayTo565[] = {0x0000,0x0000,0x0000,0x0000,0x0020,0x0020
 PNG_STATIC int32_t readFLASH(PNGFILE *pFile, uint8_t *pBuf, int32_t iLen);
 PNG_STATIC int32_t seekMem(PNGFILE *pFile, int32_t iPosition);
 PNG_STATIC int PNGInit(PNGIMAGE *pPNG);
+PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions);
 
 // C API
 int PNG_openRAM(PNGIMAGE *pPNG, uint8_t *pData, int iDataSize, PNG_DRAW_CALLBACK *pfnDraw)
@@ -147,6 +148,36 @@ uint8_t * PNG_getBuffer(PNGIMAGE *pPNG)
 {
     return pPNG->pImage;
 } /* PNG_getBuffer() */
+
+void PNG_setBuffer(PNGIMAGE *pPNG, uint8_t *pBuffer)
+{
+    pPNG->pImage = pBuffer;
+} /* PNG_setBuffer() */
+
+int PNG_decode(PNGIMAGE *pPNG, void *pUser, int iOptions)
+{
+    return DecodePNG(pPNG, pUser, iOptions);
+} /* PNG_decode() */
+
+int PNG_getBpp(PNGIMAGE *pPNG)
+{
+    return (int)pPNG->ucBpp;
+} /* PNG_getBpp() */
+
+int PNG_getPixelType(PNGIMAGE *pPNG)
+{
+    return (int)pPNG->ucPixelType;
+} /* PNG_getPixelType() */
+
+int PNG_hasAlpha(PNGIMAGE *pPNG)
+{
+    return pPNG->iHasAlpha;
+} /* PNG_hasAlpha() */
+
+int PNG_isInterlaced(PNGIMAGE *pPNG)
+{
+    return pPNG->iInterlaced;
+} /* PNG_isInterlaced() */
 
 #endif // !__cplusplus
 PNG_STATIC uint8_t PNGMakeMask(PNGDRAW *pDraw, uint8_t *pMask, uint8_t ucThreshold)
@@ -619,6 +650,208 @@ PNG_STATIC int32_t readRAM(PNGFILE *pFile, uint8_t *pBuf, int32_t iLen)
 // Verify it's a PNG file and then parse the IHDR chunk
 // to get basic image size/type/etc
 //
+
+//
+// External (caller supplied) buffer mode
+//
+// Embedded targets often have no heap at all. A PNGEXTERNALBUFFERS structure
+// can be passed to decode() through pUser with its magic field set. In that
+// mode every working memory area (two de-filter lines, the 32K zlib window,
+// the inflate state, the 2K chunk read buffer, palette and comment storage)
+// comes from caller supplied buffers and the decoder performs no internal
+// allocation. This also unlocks Adam7 interlaced images, which decode into
+// the caller supplied full-image buffer (pImage set via setBuffer()).
+//
+// PNG_EXT_BUFFER_MAGIC deliberately sits in the high word so it cannot
+// collide with a normal 32-bit pUser pointer value.
+//
+#define PNG_EXT_BUFFER_MAGIC 0x504e4758u /* 'PNGX' */
+#define PNG_EXT_BUFFER_TYPES_DEFINED 1
+typedef struct png_external_buffers_tag
+{
+    uint32_t u32Magic;       // must be PNG_EXT_BUFFER_MAGIC
+    uint8_t *pLineBuffer;    // caller supplied line/work buffer
+    int iLineBufferSize;     // size of the line buffer in bytes
+    uint8_t *pWorkspace;     // caller supplied zlib/palette workspace
+    int iWorkspaceSize;      // size of the workspace in bytes
+    void *pUser;             // delivered to the draw callback in callback mode
+    /* output fields, filled in by the decoder */
+    int iLineBufferNeeded;   // minimum line buffer size for this image
+    int iWorkspaceNeeded;    // minimum workspace size for this image
+    int iImageBufferNeeded;  // full-image buffer size (interlaced images)
+} PNGEXTERNALBUFFERS;
+
+// Adam7 interlacing: start (x,y) and (dx,dy) step for each of the 7 passes
+static const uint8_t PNGAdam7XStart[7] = {0, 4, 0, 2, 0, 1, 0};
+static const uint8_t PNGAdam7YStart[7] = {0, 0, 4, 0, 2, 0, 1};
+static const uint8_t PNGAdam7XStep[7]  = {8, 8, 4, 4, 2, 2, 1};
+static const uint8_t PNGAdam7YStep[7]  = {8, 8, 8, 4, 4, 2, 2};
+
+PNG_STATIC int PNGAlign16(int i)
+{
+    return (i + 15) & ~15;
+} /* PNGAlign16() */
+
+//
+// Minimum workspace size (independent of image geometry):
+// inflate state + 32K sliding window + 1K palette + 2K file chunk buffer
+// + 128 byte comment string
+//
+PNG_STATIC int PNGWorkspaceSize(void)
+{
+    return PNGAlign16((int)sizeof(struct inflate_state)) + 32768 + 1024 +
+           PNG_FILE_BUF_SIZE + PNG_COMMENT_SIZE;
+} /* PNGWorkspaceSize() */
+
+//
+// Minimum line buffer size for an image with the given pitch
+// (two filter-prefixed 16-byte aligned lines plus 512 bytes reserved at the
+// top for the optional PNG_FAST_PALETTE RGB565 lookup table)
+//
+PNG_STATIC int PNGLineBufferSize(int iPitch)
+{
+    return PNGAlign16(16 + iPitch + 1) + PNGAlign16(iPitch + 1) + 512;
+} /* PNGLineBufferSize() */
+
+//
+// Store the minimum buffer requirements of the currently open image into
+// the PNGEXTERNALBUFFERS structure. The pointer may also be passed directly
+// to decode() afterwards. Returns PNG_SUCCESS or PNG_INVALID_PARAMETER.
+//
+PNG_STATIC int PNGGetExternalBufferSizes(PNGIMAGE *pPage, PNGEXTERNALBUFFERS *pExt)
+{
+    if (pExt == NULL || pPage->iPitch <= 0)
+        return PNG_INVALID_PARAMETER;
+    pExt->u32Magic = PNG_EXT_BUFFER_MAGIC;
+    pExt->iLineBufferNeeded = PNGLineBufferSize(pPage->iPitch);
+    pExt->iWorkspaceNeeded = PNGWorkspaceSize();
+    pExt->iImageBufferNeeded = pPage->iHeight * pPage->iPitch;
+    return PNG_SUCCESS;
+} /* PNGGetExternalBufferSizes() */
+
+//
+// Carve the individual working areas out of the caller supplied workspace.
+// Returns PNG_SUCCESS or PNG_MEM_ERROR when a buffer is missing/too small.
+//
+PNG_STATIC int PNGSetupExternalBuffers(PNGIMAGE *pPage, PNGEXTERNALBUFFERS *pExt,
+                                       uint8_t **ppZlib, uint8_t **ppFileBuf,
+                                       uint8_t **ppPalette, uint16_t **ppFastPalette,
+                                       char **ppComment)
+{
+    uint8_t *p;
+    int iOff, iStateSize;
+
+    if (pExt->pLineBuffer == NULL || pExt->iLineBufferSize <= 0 ||
+        pExt->pWorkspace == NULL || pExt->iWorkspaceSize <= 0)
+        return PNG_MEM_ERROR;
+    if (pExt->iLineBufferSize < PNGLineBufferSize(pPage->iPitch))
+        return PNG_MEM_ERROR;
+    if (pExt->iWorkspaceSize < PNGWorkspaceSize())
+        return PNG_MEM_ERROR;
+
+    iStateSize = PNGAlign16((int)sizeof(struct inflate_state));
+    memset(pExt->pWorkspace, 0, pExt->iWorkspaceSize);
+    p = pExt->pWorkspace;
+    *ppZlib = p;                                     // inflate state + window
+    iOff = iStateSize + 32768;
+    *ppPalette = (uint8_t *)&pExt->pWorkspace[iOff];  // 1024 byte palette
+    iOff += 1024;
+    *ppFileBuf = (uint8_t *)&pExt->pWorkspace[iOff];  // 2K chunk buffer
+    iOff += PNG_FILE_BUF_SIZE;
+    *ppComment = (char *)&pExt->pWorkspace[iOff];     // comment string
+    // fast RGB565 palette lives at the top of the line buffer
+    *ppFastPalette = (uint16_t *)&pExt->pLineBuffer[pExt->iLineBufferSize - 512];
+    return PNG_SUCCESS;
+} /* PNGSetupExternalBuffers() */
+
+//
+// Write one de-filtered Adam7 scanline into its positions inside the
+// full-size image buffer
+//
+PNG_STATIC void PNGPlaceAdam7Line(uint8_t *pImage, const uint8_t *pLine,
+                                  int iWidth, int iPitch, int y,
+                                  int xStart, int xStep, int yStep,
+                                  int iPixelType, int iBpp)
+{
+    int x, i;
+    if (iBpp < 8) { // packed sub-byte pixels (grayscale / indexed)
+        int iBitsPerPixel = iBpp;
+        for (x = 0; x < iWidth; x++) {
+            int iSrcBit = x * iBitsPerPixel;
+            int iByte = iSrcBit >> 3;
+            int iShift = 8 - iBitsPerPixel - (iSrcBit & 7);
+            int iValue = (pLine[iByte] >> iShift) & ((1 << iBitsPerPixel) - 1);
+            int iDstX = xStart + x * xStep;
+            int iDstBit = iDstX * iBitsPerPixel;
+            int iDstByte = iDstBit >> 3;
+            int iDstShift = 8 - iBitsPerPixel - (iDstBit & 7);
+            uint8_t *pDst = &pImage[y * iPitch + iDstByte];
+            *pDst = (uint8_t)((*pDst & ~(((1 << iBitsPerPixel) - 1) << iDstShift)) |
+                              (iValue << iDstShift));
+        }
+    } else {
+        int iBytesPerPixel;
+        switch (iPixelType) {
+            case PNG_PIXEL_GRAY_ALPHA:
+                iBytesPerPixel = 2 * (iBpp / 8);
+                break;
+            case PNG_PIXEL_TRUECOLOR:
+                iBytesPerPixel = 3 * (iBpp / 8);
+                break;
+            case PNG_PIXEL_TRUECOLOR_ALPHA:
+                iBytesPerPixel = 4 * (iBpp / 8);
+                break;
+            default: // grayscale / indexed, 8 bits per pixel
+                iBytesPerPixel = 1;
+                break;
+        }
+        for (x = 0; x < iWidth; x++) {
+            int iDstX = xStart + x * xStep;
+            uint8_t *pDst = &pImage[y * iPitch + iDstX * iBytesPerPixel];
+            const uint8_t *pSrc = &pLine[x * iBytesPerPixel];
+            for (i = 0; i < iBytesPerPixel; i++)
+                pDst[i] = pSrc[i];
+        }
+    }
+    (void)yStep; // the caller selects the destination row directly
+} /* PNGPlaceAdam7Line() */
+
+//
+// Calculate the geometry of one Adam7 interlace pass from the image geometry
+//
+PNG_STATIC void PNGAdam7PassGeometry(PNGIMAGE *pPage, int iPass,
+                                     int *piX, int *piY, int *piWidth,
+                                     int *piHeight, int *piPitch)
+{
+    int xStart = PNGAdam7XStart[iPass];
+    int yStart = PNGAdam7YStart[iPass];
+    int xStep = PNGAdam7XStep[iPass];
+    int yStep = PNGAdam7YStep[iPass];
+    int iWidth, iHeight, iPitch;
+
+    *piX = xStart;
+    *piY = yStart;
+    iWidth = (pPage->iWidth > xStart) ? (pPage->iWidth - xStart + xStep - 1) / xStep : 0;
+    iHeight = (pPage->iHeight > yStart) ? (pPage->iHeight - yStart + yStep - 1) / yStep : 0;
+    *piWidth = iWidth;
+    *piHeight = iHeight;
+    switch (pPage->ucPixelType) {
+        case PNG_PIXEL_TRUECOLOR:
+            iPitch = ((3 * pPage->ucBpp) * iWidth + 7) / 8;
+            break;
+        case PNG_PIXEL_GRAY_ALPHA:
+            iPitch = ((2 * pPage->ucBpp) * iWidth + 7) / 8;
+            break;
+        case PNG_PIXEL_TRUECOLOR_ALPHA:
+            iPitch = ((4 * pPage->ucBpp) * iWidth + 7) / 8;
+            break;
+        default: // grayscale / indexed
+            iPitch = (iWidth * pPage->ucBpp + 7) / 8;
+            break;
+    }
+    *piPitch = iPitch;
+} /* PNGAdam7PassGeometry() */
+
 PNG_STATIC int PNGParseInfo(PNGIMAGE *pPage)
 {
     uint8_t *s = pPage->ucFileBuf;
@@ -651,14 +884,15 @@ PNG_STATIC int PNGParseInfo(PNGIMAGE *pPage)
         }
         pPage->iWidth = MOTOLONG(&s[16]);
         pPage->iHeight = MOTOLONG(&s[20]);
-        if (pPage->iWidth <= 0 || pPage->iHeight <= 0 || pPage->iWidth > PNG_MAX_BUFFERED_PIXELS / 4) {  // Image size is outside of valid range
+        if (pPage->iWidth <= 0 || pPage->iHeight <= 0 ||
+            pPage->iWidth > 65535 || pPage->iHeight > 65535) {  // Image size is outside of valid range
             pPage->iError = PNG_TOO_BIG;
             return pPage->iError;
         }
         pPage->ucBpp = s[24]; // bits per pixel
         pPage->ucPixelType = s[25]; // pixel type
         pPage->iInterlaced = s[28];
-        if (pPage->iInterlaced || pPage->ucBpp > 8) { // 16-bit pixels are not supported (yet)
+        if (pPage->ucBpp > 8) { // 16-bit pixels are not supported (yet)
             pPage->iError = PNG_UNSUPPORTED_FEATURE;
             return pPage->iError;
         }
@@ -688,8 +922,12 @@ PNG_STATIC int PNGParseInfo(PNGIMAGE *pPage)
                 pPage->iHasAlpha = 1;
         } // switch
     }
-    if ((pPage->iPitch+1)*2 + 32 > PNG_MAX_BUFFERED_PIXELS)
-       return PNG_TOO_BIG;
+    if (pPage->iPitch <= 0) { // malformed header
+       pPage->iError = PNG_INVALID_FILE;
+       return pPage->iError;
+    }
+    // The internal (default) line buffer capacity is enforced again in
+    // DecodePNG(); external buffer mode uses caller supplied memory instead.
 
     return PNG_SUCCESS;
 } /* PNGParseInfo() */
@@ -812,35 +1050,104 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
     int iMarker=0;
     uint8_t *tmp, *pCurr, *pPrev;
     z_stream d_stream; /* decompression stream */
-    uint8_t *s = pPage->ucFileBuf;
+    uint8_t *s;
     struct inflate_state *state;
-    
-    // Either the image buffer must be allocated or a draw callback must be set before entering
-    if (pPage->pImage == NULL && pPage->pfnDraw == NULL) {
-        pPage->iError = PNG_NO_BUFFER;
-        return 0;
-    }
-    // Use internal buffer to maintain the current and previous lines
-    y = (int)(intptr_t)&pPage->ucPixels[0];
-    y &= 15; // make sure we're 16-byte aligned, -1 for filter byte
-    y += (15 - y);
-    pCurr = &pPage->ucPixels[y]; // so that the pixels are 16-byte aligned
-    y += pPage->iPitch + 1; // both lines are 16-byte (minus 1)
-    y += (15 - (y & 15));
-    pPrev = &pPage->ucPixels[y];
+    /* memory areas which can be redirected to caller supplied buffers */
+    uint8_t *pZlib, *pFileBuf, *pPalette;
+    uint16_t *pFastPalette;
+    char *pComment;
+    PNGEXTERNALBUFFERS *pExt = NULL;
+    int bExternal = 0;
+    /* Adam7 interlace state */
+    int iPass = 0, iPassX = 0, iPassY = 0, iPassWidth = 0, iPassHeight = 0;
+    int iPassPitch = 0, iPassLine = 0;
+
+    // External buffer mode is selected by passing a PNGEXTERNALBUFFERS
+    // descriptor (with its magic field set) as the pUser argument
+    if (pUser != NULL && ((PNGEXTERNALBUFFERS *)pUser)->u32Magic == PNG_EXT_BUFFER_MAGIC)
+        pExt = (PNGEXTERNALBUFFERS *)pUser;
     pPage->iError = PNG_SUCCESS;
+
+    if (pExt != NULL) {
+        bExternal = 1;
+        // fill in the minimum sizes so the caller can also use this call to
+        // discover the buffer requirements (pass NULL buffers for a pure query)
+        PNGGetExternalBufferSizes(pPage, pExt);
+        // interlaced images are assembled into the full image buffer only
+        if (pPage->iInterlaced && pPage->pImage == NULL) {
+            pPage->iError = PNG_NO_BUFFER;
+            return pPage->iError;
+        }
+        err = PNGSetupExternalBuffers(pPage, pExt, &pZlib, &pFileBuf, &pPalette,
+                                      &pFastPalette, &pComment);
+        if (err != PNG_SUCCESS) {
+            pPage->iError = err;
+            return err;
+        }
+        // carve the two de-filter lines out of the caller supplied line buffer
+        y = (int)((16 - (((intptr_t)pExt->pLineBuffer) & 15)) & 15);
+        pCurr = &pExt->pLineBuffer[y]; // pixels start 16-byte aligned
+        y += PNGAlign16(pPage->iPitch + 1);
+        pPrev = &pExt->pLineBuffer[y];
+        pComment[0] = 0;
+    } else {
+        // Either an image buffer must be set or a draw callback supplied
+        if (pPage->pImage == NULL && pPage->pfnDraw == NULL) {
+            pPage->iError = PNG_NO_BUFFER;
+            return 0;
+        }
+        // Default mode: interlacing and over-wide images exceed the internal
+        // fixed-size buffers, so they remain rejected here exactly as before
+        if (pPage->iInterlaced) {
+            pPage->iError = PNG_UNSUPPORTED_FEATURE;
+            return pPage->iError;
+        }
+        if (pPage->iWidth > PNG_MAX_BUFFERED_PIXELS / 4 ||
+            (pPage->iPitch+1)*2 + 32 > PNG_MAX_BUFFERED_PIXELS) {
+            pPage->iError = PNG_TOO_BIG;
+            return pPage->iError;
+        }
+        pZlib = pPage->ucZLIB;
+        pFileBuf = pPage->ucFileBuf;
+        pPalette = pPage->ucPalette;
+        pFastPalette = (uint16_t *)&pPage->ucPixels[sizeof(pPage->ucPixels)-512];
+        pComment = &pPage->szComment[0];
+        // Use internal buffer to maintain the current and previous lines
+        y = (int)(intptr_t)&pPage->ucPixels[0];
+        y &= 15; // make sure we're 16-byte aligned, -1 for filter byte
+        y += (15 - y);
+        pCurr = &pPage->ucPixels[y]; // so that the pixels are 16-byte aligned
+        y += pPage->iPitch + 1; // both lines are 16-byte (minus 1)
+        y += (15 - (y & 15));
+        pPrev = &pPage->ucPixels[y];
+    }
+    s = pFileBuf;
+    if (pPage->iInterlaced) {
+        // interlaced output is scattered into a zeroed full-image buffer
+        memset(pPage->pImage, 0, pPage->iHeight * pPage->iPitch);
+        memset(pCurr, 0, pPage->iPitch + 1);
+        memset(pPrev, 0, pPage->iPitch + 1);
+        PNGAdam7PassGeometry(pPage, iPass, &iPassX, &iPassY,
+                             &iPassWidth, &iPassHeight, &iPassPitch);
+        while (iPass < 7 && (iPassWidth == 0 || iPassHeight == 0)) {
+            iPass++;
+            if (iPass < 7)
+                PNGAdam7PassGeometry(pPage, iPass, &iPassX, &iPassY,
+                                     &iPassWidth, &iPassHeight, &iPassPitch);
+        }
+    }
     // Start decoding the image
     bDone = FALSE;
     // Inflate the compressed image data
     // The allocation functions are disabled and zlib has been modified
-    // to not use malloc/free and instead the buffer is part of the PNG class
+    // to not use malloc/free; the state buffer is internal or caller supplied
     d_stream.zalloc = (alloc_func)0;
     d_stream.zfree = (free_func)0;
     d_stream.opaque = (voidpf)0;
     // Insert the memory pointer here to avoid having to use malloc() inside zlib
-    state = (struct inflate_state FAR *)pPage->ucZLIB;
+    state = (struct inflate_state FAR *)pZlib;
     d_stream.state = (struct internal_state FAR *)state;
-    state->window = &pPage->ucZLIB[sizeof(struct inflate_state)]; // point to 32k dictionary buffer
+    state->window = &pZlib[sizeof(struct inflate_state)]; // point to 32k dictionary buffer
     err = inflateInit(&d_stream);
 #ifdef FUTURE
 //    if (inpage->cCompression == PIL_COMP_IPHONE_FLATE)
@@ -848,7 +1155,7 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
 //    else
 //        err = mz_inflateInit2(&d_stream, 15);
 #endif // FUTURE
-    
+
     iFileOffset = 8; // skip PNG file signature
     iOffset = 0; // internal buffer offset starts at 0
     iBytesRead = 0; // We haven't read yet anything
@@ -858,7 +1165,7 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
 
     // continue until fully decoded
     // parse the markers until the next data block
-    while (!bDone && y < pPage->iHeight)
+    while (!bDone && (!pPage->iInterlaced ? (y < pPage->iHeight) : 1))
     {
         if (iOffset > iBytesRead-8) { // need to read more data
             iFileOffset += (iOffset - iBytesRead);
@@ -895,28 +1202,28 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                 break;
 #endif
             case 0x504c5445: //'PLTE' palette colors
-                memset(&pPage->ucPalette[768], 0xff, 256); // assume all colors are opaque unless specified
+                memset(&pPalette[768], 0xff, 256); // assume all colors are opaque unless specified
                 if (iLen > 0 && iLen <= 768 && iLen <= iAvailable) {
-                    memcpy(pPage->ucPalette, &s[iOffset], iLen);
+                    memcpy(pPalette, &s[iOffset], iLen);
                 }
                 if (iOptions & PNG_FAST_PALETTE) { // create a RGB565 palette
                     int i, iColors = 1 << pPage->ucBpp;
                     uint16_t usPixel, *d;
-                    uint8_t *s = pPage->ucPalette;
-                    d = (uint16_t *)&pPage->ucPixels[sizeof(pPage->ucPixels)-512];
+                    uint8_t *pPalSrc = pPalette;
+                    d = pFastPalette;
                     for (i=0; i<iColors; i++) {
-                    usPixel = (s[2] >> 3); // blue
-                    usPixel |= ((s[1] >> 2) << 5); // green
-                    usPixel |= ((s[0] >> 3) << 11); // red
+                    usPixel = (pPalSrc[2] >> 3); // blue
+                    usPixel |= ((pPalSrc[1] >> 2) << 5); // green
+                    usPixel |= ((pPalSrc[0] >> 3) << 11); // red
                     *d++ = usPixel;
-                    s += 3;
+                    pPalSrc += 3;
                     }
                 }
                 break;
             case 0x74524e53: //'tRNS' transparency info
                 if (pPage->ucPixelType == PNG_PIXEL_INDEXED && iLen > 0 && iLen <= 256 && iLen <= iAvailable) // if palette exists
                 {
-                    memcpy(&pPage->ucPalette[768], &s[iOffset], iLen);
+                    memcpy(&pPalette[768], &s[iOffset], iLen);
                     pPage->iHasAlpha = 1;
                 }
                 else if (iLen == 2) // for grayscale images
@@ -933,10 +1240,82 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                 }
                 break;
             case 0x49444154: //'IDAT' image data block
-                while (iLen) {
+                if (pPage->iInterlaced) {
+                    // Adam7: each pass is an independent sub-image fed by the
+                    // same zlib stream; de-filtered lines are scattered into
+                    // the full-size image buffer
+                    while (iLen && !bDone) {
+                        if (iOffset >= iBytesRead) {
+                            // we ran out of data; get some more
+                            iBytesRead = (*pPage->pfnRead)(&pPage->PNGFile, pFileBuf, (iLen > PNG_FILE_BUF_SIZE) ? PNG_FILE_BUF_SIZE : iLen);
+                            iFileOffset += iBytesRead;
+                            iOffset = 0;
+                        } else {
+                            // number of bytes remaining in buffer
+                            iBytesRead -= iOffset;
+                        }
+                        if (iBytesRead > iLen) { // we read too much
+                            d_stream.next_in  = &pFileBuf[iOffset];
+                            d_stream.avail_in = iLen;
+                            iOffset += iLen;
+                            iBytesRead -= iLen;
+                            iLen = 0;
+                        } else {
+                            d_stream.next_in  = &pFileBuf[iOffset];
+                            d_stream.avail_in = iBytesRead;
+                            iLen -= iBytesRead;
+                            iOffset += iBytesRead;
+                            iBytesRead = 0;
+                        }
+                        err = 0;
+                        while (err == Z_OK && iPass < 7) {
+                            if (d_stream.avail_out == 0) { // reset for next pass line
+                                d_stream.avail_out = iPassPitch + 1;
+                                d_stream.next_out = pCurr;
+                            }
+                            err = inflate(&d_stream, Z_NO_FLUSH, iOptions & PNG_CHECK_CRC);
+                            if ((err == Z_OK || err == Z_STREAM_END) && d_stream.avail_out == 0) {
+                                DeFilter(pCurr, pPrev, iPassWidth, iPassPitch);
+                                PNGPlaceAdam7Line(pPage->pImage, &pCurr[1],
+                                                  iPassWidth, pPage->iPitch,
+                                                  iPassY + iPassLine * PNGAdam7YStep[iPass],
+                                                  iPassX, PNGAdam7XStep[iPass],
+                                                  PNGAdam7YStep[iPass],
+                                                  pPage->ucPixelType, pPage->ucBpp);
+                                iPassLine++;
+                                // swap current and previous lines
+                                tmp = pCurr; pCurr = pPrev; pPrev = tmp;
+                                if (iPassLine >= iPassHeight) { // pass complete
+                                    do {
+                                        iPass++;
+                                        if (iPass < 7) {
+                                            PNGAdam7PassGeometry(pPage, iPass, &iPassX, &iPassY,
+                                                                 &iPassWidth, &iPassHeight, &iPassPitch);
+                                        }
+                                    } while (iPass < 7 && (iPassWidth == 0 || iPassHeight == 0));
+                                    iPassLine = 0;
+                                    if (iPass >= 7) { // every pass decoded
+                                        bDone = TRUE;
+                                    } else { // new pass starts with an all-zero predecessor
+                                        memset(pCurr, 0, iPassPitch + 1);
+                                        memset(pPrev, 0, iPassPitch + 1);
+                                    }
+                                    d_stream.avail_out = 0;
+                                }
+                            }
+                        }
+                        if (err == Z_DATA_ERROR || err == Z_STREAM_ERROR) {
+                            iLen = 0;
+                            pPage->iError = PNG_DECODE_ERROR;
+                            bDone = TRUE;
+                        } else if (err == Z_BUF_ERROR) {
+                            // need more compressed data
+                        }
+                    } // while (iLen)
+                } else while (iLen) {
                     if (iOffset >= iBytesRead) {
                         // we ran out of data; get some more
-                        iBytesRead = (*pPage->pfnRead)(&pPage->PNGFile, pPage->ucFileBuf, (iLen > PNG_FILE_BUF_SIZE) ? PNG_FILE_BUF_SIZE : iLen);
+                        iBytesRead = (*pPage->pfnRead)(&pPage->PNGFile, pFileBuf, (iLen > PNG_FILE_BUF_SIZE) ? PNG_FILE_BUF_SIZE : iLen);
                         iFileOffset += iBytesRead;
                         iOffset = 0;
                     } else {
@@ -944,13 +1323,13 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                         iBytesRead -= iOffset;
                     }
                     if (iBytesRead > iLen) { // we read too much
-                        d_stream.next_in  = &pPage->ucFileBuf[iOffset];
+                        d_stream.next_in  = &pFileBuf[iOffset];
                         d_stream.avail_in = iLen;
                         iOffset += iLen; // point to start of next marker
                         iBytesRead -= iLen; // keep remaining byte count
                         iLen = 0; // every byte will be decoded
                     } else {
-                        d_stream.next_in  = &pPage->ucFileBuf[iOffset];
+                        d_stream.next_in  = &pFileBuf[iOffset];
                         d_stream.avail_in = iBytesRead;
                         iLen -= iBytesRead;
                         iOffset += iBytesRead;
@@ -972,11 +1351,11 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                             DeFilter(pCurr, pPrev, pPage->iWidth, pPage->iPitch);
                             if (pPage->pImage == NULL) { // no image buffer, send it line by line
                                 PNGDRAW pngd;
-                                pngd.pUser = pUser;
+                                pngd.pUser = bExternal ? pExt->pUser : pUser;
                                 pngd.iPitch = pPage->iPitch;
                                 pngd.iWidth = pPage->iWidth;
-                                pngd.pPalette = pPage->ucPalette;
-                                pngd.pFastPalette = (iOptions & PNG_FAST_PALETTE) ? (uint16_t *)&pPage->ucPixels[sizeof(pPage->ucPixels)-512] : NULL;
+                                pngd.pPalette = pPalette;
+                                pngd.pFastPalette = (iOptions & PNG_FAST_PALETTE) ? pFastPalette : NULL;
                                 pngd.pPixels = pCurr+1;
                                 pngd.iPixelType = pPage->ucPixelType;
                                 pngd.iHasAlpha = pPage->iHasAlpha;
@@ -1029,20 +1408,20 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                 char *pDest = NULL;
                 memcpy(szTemp, &s[iOffset], 64); // get the label length (Title, Author, Description, Copyright, Creation Time, Software, Disclaimer, Warning, Source, Comment)
                 i = (int)strlen(szTemp) + 1; // start of actual text
-                if (strcmp(szTemp, "Comment") == 0 || strcmp(szTemp, "Description") == 0) pDest = &pPage->szComment[0];
+                if (strcmp(szTemp, "Comment") == 0 || strcmp(szTemp, "Description") == 0) pDest = pComment;
                 //else if (strcmp(szTemp, "Software") == 0) pDest = &pPage->szSoftware[0];
                 //else if (strcmp(szTemp, "Author") == 0) pDest = &pPage->szArtist[0];
                 if (pDest != NULL && iLen > i)
                 {
                     if ((iLen - i) < PNG_COMMENT_SIZE)
                     {
-                        memcpy(pPage->szComment, &s[iOffset + i], iLen - i);
-                        pPage->szComment[iLen - i + 1] = 0;
+                        memcpy(pDest, &s[iOffset + i], iLen - i);
+                        pDest[iLen - i + 1] = 0;
                     }
                     else
                     {
-                        memcpy(pPage->szComment, &s[iOffset + i], PNG_COMMENT_SIZE-1);
-                        pPage->szComment[PNG_COMMENT_SIZE-1] = '\0';
+                        memcpy(pDest, &s[iOffset + i], PNG_COMMENT_SIZE-1);
+                        pDest[PNG_COMMENT_SIZE-1] = '\0';
                     }
                 }
             }
@@ -1053,3 +1432,27 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
     err = inflateEnd(&d_stream);
     return pPage->iError;
 } /* DecodePNG() */
+
+//
+// Externally linkable minimum-buffer query for external buffer mode.
+// The C++ PNG class contains its PNGIMAGE state as the first member, so the
+// same function serves PNG& (C++) and PNGIMAGE* (plain C). It is defined here
+// (rather than in the public header) so the public interface stays untouched.
+//
+#ifdef __cplusplus
+extern "C"
+#endif
+int PNG_getExternalBufferSizes(void *pPNG, void *pExtBuf)
+{
+    PNGIMAGE *pPage = (PNGIMAGE *)pPNG;
+    PNGEXTERNALBUFFERS *pExt = (PNGEXTERNALBUFFERS *)pExtBuf;
+
+    if (pPage == NULL || pExt == NULL || pPage->iPitch <= 0)
+        return PNG_INVALID_PARAMETER;
+    pExt->u32Magic = PNG_EXT_BUFFER_MAGIC;
+    pExt->iLineBufferNeeded = PNGLineBufferSize(pPage->iPitch);
+    pExt->iWorkspaceNeeded = PNGWorkspaceSize();
+    pExt->iImageBufferNeeded = pPage->iHeight * pPage->iPitch;
+    return PNG_SUCCESS;
+} /* PNG_getExternalBufferSizes() */
+
