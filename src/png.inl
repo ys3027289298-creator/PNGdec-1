@@ -21,6 +21,136 @@
 //
 #include "zlib.h"
 //
+// Decompression bomb protection (resource limits)
+//
+// Three configurable limits, each disabled by setting it to 0:
+//   max pixels  - width*height of the image
+//   max memory  - estimated/actual bytes needed to decode (image + decoder state)
+//   max ratio   - per-IDAT-chunk inflate ratio (uncompressed:compressed)
+// Defaults can be overridden at compile time with the macros below.
+// On desktop targets they can also be overridden at runtime with the
+// environment variables PNG_MAX_PIXELS, PNG_MAX_MEM and PNG_MAX_RATIO.
+// An invalid (non-numeric/negative/overflowing) value is rejected with
+// PNG_INVALID_PARAMETER. When a limit rejects a file, the reason is
+// written to the comment string (read it with getComment()).
+//
+#ifndef PNG_LIMIT_MAX_PIXELS
+#define PNG_LIMIT_MAX_PIXELS 16777216ULL /* 16M pixels */
+#endif
+#ifndef PNG_LIMIT_MAX_MEM
+#define PNG_LIMIT_MAX_MEM 67108864ULL /* 64 MB */
+#endif
+#ifndef PNG_LIMIT_MAX_RATIO
+#define PNG_LIMIT_MAX_RATIO 2048ULL /* > max legit deflate ratio (1032:1) */
+#endif
+#define PNG_LIMIT_PIXELS_CAP 0x10000000000ULL /* 2^40 */
+#define PNG_LIMIT_MEM_CAP    0x1000000000000ULL /* 2^48 */
+#define PNG_LIMIT_RATIO_CAP  0x100000ULL /* 2^20, keeps ratio*consumed in uint64_t */
+
+static uint64_t s_uMaxPixels, s_uMaxMem, s_uMaxRatio;
+
+// Parse a non-negative decimal limit value; returns 0 on success
+static int PNGParseLimit(const char *sz, uint64_t uCap, uint64_t *pVal)
+{
+    uint64_t u = 0;
+    if (sz == NULL || *sz == 0)
+        return 1;
+    while (*sz) {
+        if (*sz < '0' || *sz > '9')
+            return 1; // non-numeric (also rejects signs/spaces)
+        u = u * 10 + (uint64_t)(*sz - '0');
+        if (u > uCap)
+            return 1; // unreasonably large
+        sz++;
+    }
+    *pVal = u;
+    return 0;
+} /* PNGParseLimit() */
+
+// Append a decimal number to a string bounded by PNG_COMMENT_SIZE
+static void PNGCatU64(char *d, int *pLeft, uint64_t u)
+{
+    char szTemp[24];
+    int i = sizeof(szTemp);
+    szTemp[--i] = 0;
+    if (u == 0)
+        szTemp[--i] = '0';
+    while (u && i > 0) {
+        szTemp[--i] = (char)('0' + (u % 10));
+        u /= 10;
+    }
+    while (szTemp[i] && *pLeft > 1) {
+        *d++ = szTemp[i++];
+        (*pLeft)--;
+    }
+    *d = 0;
+} /* PNGCatU64() */
+
+static void PNGCatStr(char *d, int *pLeft, const char *s)
+{
+    while (*s && *pLeft > 1) {
+        *d++ = *s++;
+        (*pLeft)--;
+    }
+    *d = 0;
+} /* PNGCatStr() */
+
+// Store a rejection reason of the form: strA numA strB numB
+static void PNGReason(PNGIMAGE *pPNG, const char *szA, uint64_t uA, const char *szB, uint64_t uB)
+{
+    int iLeft = PNG_COMMENT_SIZE;
+    char *d = pPNG->szComment;
+    d[0] = 0;
+    PNGCatStr(d, &iLeft, szA);
+    PNGCatU64(&d[strlen(d)], &iLeft, uA);
+    PNGCatStr(&d[strlen(d)], &iLeft, szB);
+    PNGCatU64(&d[strlen(d)], &iLeft, uB);
+} /* PNGReason() */
+
+// Store a reason of the form: strA strB (e.g. parameter name + bad value)
+static void PNGReasonStr(PNGIMAGE *pPNG, const char *szA, const char *szB)
+{
+    int iLeft = PNG_COMMENT_SIZE;
+    char *d = pPNG->szComment;
+    d[0] = 0;
+    PNGCatStr(d, &iLeft, szA);
+    PNGCatStr(&d[strlen(d)], &iLeft, szB);
+} /* PNGReasonStr() */
+
+// Load the configured limits; called at open and again at decode so that
+// the limits in effect at decode time are enforced. Returns PNG_SUCCESS
+// or PNG_INVALID_PARAMETER.
+static int PNGInitLimits(PNGIMAGE *pPNG)
+{
+#if defined(__LINUX__) || defined(__MACH__)
+    const char *szName, *sz;
+#endif
+    s_uMaxPixels = (uint64_t)PNG_LIMIT_MAX_PIXELS;
+    s_uMaxMem = (uint64_t)PNG_LIMIT_MAX_MEM;
+    s_uMaxRatio = (uint64_t)PNG_LIMIT_MAX_RATIO;
+#if defined(__LINUX__) || defined(__MACH__)
+    szName = "PNG_MAX_PIXELS";
+    sz = getenv(szName);
+    if (sz == NULL || PNGParseLimit(sz, PNG_LIMIT_PIXELS_CAP, &s_uMaxPixels) == 0) {
+        szName = "PNG_MAX_MEM";
+        sz = getenv(szName);
+        if (sz == NULL || PNGParseLimit(sz, PNG_LIMIT_MEM_CAP, &s_uMaxMem) == 0) {
+            szName = "PNG_MAX_RATIO";
+            sz = getenv(szName);
+            if (sz == NULL || PNGParseLimit(sz, PNG_LIMIT_RATIO_CAP, &s_uMaxRatio) == 0)
+                sz = NULL; // all three parsed ok
+        }
+    }
+    if (sz != NULL) { // a limit parameter was present but invalid
+        PNGReasonStr(pPNG, "LIMIT: invalid parameter ", szName);
+        pPNG->iError = PNG_INVALID_PARAMETER;
+        return pPNG->iError;
+    }
+#endif // __LINUX__ || __MACH__
+    return PNG_SUCCESS;
+} /* PNGInitLimits() */
+
+//
 // Convert 8-bit grayscale into RGB565
 //
 static const uint16_t usGrayTo565[] = {0x0000,0x0000,0x0000,0x0000,0x0020,0x0020,0x0020,0x0020, // 0
@@ -626,6 +756,9 @@ PNG_STATIC int PNGParseInfo(PNGIMAGE *pPage)
     
     pPage->iHasAlpha = pPage->iInterlaced = 0;
     pPage->szComment[0] = 0;
+    // Load the resource limits; invalid configuration fails the open
+    if (PNGInitLimits(pPage) != PNG_SUCCESS)
+        return pPage->iError;
     // Read a few bytes to just parse the size/pixel info
     iBytesRead = (*pPage->pfnRead)(&pPage->PNGFile, s, 33);
     if (iBytesRead < 33) { // a PNG file this tiny? probably bad
@@ -687,6 +820,22 @@ PNG_STATIC int PNGParseInfo(PNGIMAGE *pPage)
                 pPage->iPitch = ((4 * pPage->ucBpp) * pPage->iWidth + 7)/8;
                 pPage->iHasAlpha = 1;
         } // switch
+    }
+    // Pre-decode estimate: reject images whose pixel count or decoded
+    // memory footprint exceeds the configured limits (bomb protection)
+    {
+        uint64_t uPixels = (uint64_t)pPage->iWidth * (uint64_t)pPage->iHeight;
+        uint64_t uMem = (uint64_t)(pPage->iPitch + 1) * (uint64_t)pPage->iHeight + (uint64_t)sizeof(PNGIMAGE);
+        if (s_uMaxPixels && uPixels > s_uMaxPixels) {
+            PNGReason(pPage, "LIMIT: pixels ", uPixels, " > max ", s_uMaxPixels);
+            pPage->iError = PNG_TOO_BIG;
+            return pPage->iError;
+        }
+        if (s_uMaxMem && uMem > s_uMaxMem) {
+            PNGReason(pPage, "LIMIT: estimated memory ", uMem, " > max ", s_uMaxMem);
+            pPage->iError = PNG_MEM_ERROR;
+            return pPage->iError;
+        }
     }
     if ((pPage->iPitch+1)*2 + 32 > PNG_MAX_BUFFERED_PIXELS)
        return PNG_TOO_BIG;
@@ -810,16 +959,26 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
     int err, y, iLen=0;
     int bDone, iOffset, iFileOffset, iBytesRead, iAvailable;
     int iMarker=0;
+    int iFed = 0; // compressed bytes of the current IDAT segment fed to inflate
+    uint64_t uChunkIn = 0; // compressed bytes consumed from the current IDAT chunk
+    uint64_t uChunkStartOut = 0; // total_out at the start of the current IDAT chunk
+    uint64_t uExpected; // exact number of bytes a valid stream must inflate to
     uint8_t *tmp, *pCurr, *pPrev;
     z_stream d_stream; /* decompression stream */
     uint8_t *s = pPage->ucFileBuf;
     struct inflate_state *state;
-    
+
     // Either the image buffer must be allocated or a draw callback must be set before entering
     if (pPage->pImage == NULL && pPage->pfnDraw == NULL) {
         pPage->iError = PNG_NO_BUFFER;
         return 0;
     }
+    // Enforce the limits in effect at decode time; invalid config fails here too
+    if (PNGInitLimits(pPage) != PNG_SUCCESS)
+        return pPage->iError;
+    // A valid stream inflates to exactly (pitch+1) bytes per line; anything
+    // beyond that is malformed/hostile and is rejected by the checks below
+    uExpected = (uint64_t)(pPage->iPitch + 1) * (uint64_t)pPage->iHeight;
     // Use internal buffer to maintain the current and previous lines
     y = (int)(intptr_t)&pPage->ucPixels[0];
     y &= 15; // make sure we're 16-byte aligned, -1 for filter byte
@@ -933,6 +1092,8 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                 }
                 break;
             case 0x49444154: //'IDAT' image data block
+                uChunkIn = 0;
+                uChunkStartOut = (uint64_t)d_stream.total_out; // per-chunk ratio accounting starts here
                 while (iLen) {
                     if (iOffset >= iBytesRead) {
                         // we ran out of data; get some more
@@ -962,12 +1123,36 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
             //            d_stream.avail_in -= 4;
             //        }
                     err = 0;
+                    iFed = (int)d_stream.avail_in; // bytes of this chunk about to be fed
                     while (err == Z_OK) {
                         if (d_stream.avail_out == 0) { // reset for next line
                             d_stream.avail_out = pPage->iPitch+1;
                             d_stream.next_out = pCurr;
                         } // otherwise it could be a continuation of an unfinished line
                         err = inflate(&d_stream, Z_NO_FLUSH, iOptions & PNG_CHECK_CRC);
+                        // Second line of defense: re-check resource usage while inflating
+                        if (s_uMaxMem && (uint64_t)d_stream.total_out + (uint64_t)sizeof(PNGIMAGE) > s_uMaxMem) {
+                            PNGReason(pPage, "LIMIT: inflated memory ", (uint64_t)d_stream.total_out + (uint64_t)sizeof(PNGIMAGE), " > max ", s_uMaxMem);
+                            pPage->iError = PNG_MEM_ERROR;
+                            inflateEnd(&d_stream);
+                            return pPage->iError;
+                        }
+                        if ((uint64_t)d_stream.total_out > uExpected) { // more data than the header declares
+                            PNGReason(pPage, "LIMIT: inflated data exceeds declared image size ", uExpected, "", 0);
+                            pPage->iError = PNG_DECODE_ERROR;
+                            inflateEnd(&d_stream);
+                            return pPage->iError;
+                        }
+                        if (s_uMaxRatio) { // per-chunk inflate ratio check
+                            uint64_t uConsumed = uChunkIn + (uint64_t)(iFed - (int)d_stream.avail_in);
+                            uint64_t uProduced = (uint64_t)d_stream.total_out - uChunkStartOut;
+                            if (uConsumed && uProduced > s_uMaxRatio * uConsumed) {
+                                PNGReason(pPage, "LIMIT: IDAT chunk inflate ratio ", uProduced / uConsumed, " > max ", s_uMaxRatio);
+                                pPage->iError = PNG_TOO_BIG;
+                                inflateEnd(&d_stream);
+                                return pPage->iError;
+                            }
+                        }
                         if ((err == Z_OK || err == Z_STREAM_END) && d_stream.avail_out == 0) {// successfully decoded line
                             DeFilter(pCurr, pPrev, pPage->iWidth, pPage->iPitch);
                             if (pPage->pImage == NULL) { // no image buffer, send it line by line
@@ -997,6 +1182,7 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                             tmp = NULL;
                         }
                     }
+                    uChunkIn += (uint64_t)(iFed - (int)d_stream.avail_in); // compressed bytes consumed from this chunk
                     if (err == Z_STREAM_END && d_stream.avail_out == 0) {
                         // successful decode, stop here
                         y = pPage->iHeight;
