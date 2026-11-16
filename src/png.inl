@@ -799,6 +799,39 @@ PNG_STATIC int PNGInit(PNGIMAGE *pPNG)
     return PNGParseInfo(pPNG); // gather info for image
 } /* PNGInit() */
 //
+// Row-level decode pipeline (banked double buffering)
+// ---------------------------------------------------
+// Per-row decoding is split into two stages: (1) inflate compressed data
+// into a row buffer and (2) de-filter the finished row and copy it to the
+// output. With the pipeline enabled, rows are inflated into one bank of row
+// buffers while the previously filled bank goes through the de-filter + copy
+// stage; a small state machine alternates between the two banks (single
+// thread, no RTOS needed). This batches inflate over a whole bank of rows
+// per call instead of re-entering it for every single line.
+//
+// Configuration (compile-time, like PNG_MAX_BUFFERED_PIXELS):
+//   PNG_ROW_PIPELINE  - 1 (default) enables the pipeline, 0 forces the
+//                       original serial line-at-a-time decode.
+//   PNG_PIPELINE_ROWS - rows per bank, 2..64 (default 8). Total memory used
+//                       is 2 banks x rows x (iPitch+1) bytes, carved out of
+//                       the existing ucPixels[] arena (no malloc). If the
+//                       requested rows don't fit, the count is automatically
+//                       reduced; if even 2 rows per bank don't fit, decoding
+//                       silently falls back to the serial path.
+//
+#ifndef PNG_ROW_PIPELINE
+#define PNG_ROW_PIPELINE 1
+#endif
+#ifndef PNG_PIPELINE_ROWS
+#define PNG_PIPELINE_ROWS 8
+#endif
+#if PNG_ROW_PIPELINE != 0 && PNG_ROW_PIPELINE != 1
+#error "PNG_ROW_PIPELINE must be 0 (serial) or 1 (pipelined)"
+#endif
+#if PNG_ROW_PIPELINE && (PNG_PIPELINE_ROWS < 2 || PNG_PIPELINE_ROWS > 64)
+#error "PNG_PIPELINE_ROWS must be between 2 and 64"
+#endif
+//
 // Decode the PNG file
 //
 // You must call open() before calling decode()
@@ -814,6 +847,13 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
     z_stream d_stream; /* decompression stream */
     uint8_t *s = pPage->ucFileBuf;
     struct inflate_state *state;
+#if PNG_ROW_PIPELINE
+    int iPipeRows = 0;   // rows per bank; 0 = serial fallback
+    int iRowBytes;       // bytes per row, filter byte included
+    int iBank = 0;       // bank currently being filled by inflate
+    uint8_t *pBank[2];   // the two row banks (double buffering)
+    uint8_t *pPrevRow = NULL; // most recently de-filtered row (filter byte included)
+#endif
     
     // Either the image buffer must be allocated or a draw callback must be set before entering
     if (pPage->pImage == NULL && pPage->pfnDraw == NULL) {
@@ -828,6 +868,30 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
     y += pPage->iPitch + 1; // both lines are 16-byte (minus 1)
     y += (15 - (y & 15));
     pPrev = &pPage->ucPixels[y];
+#if PNG_ROW_PIPELINE
+    // Lay out the two pipeline banks inside the same ucPixels[] arena.
+    // Reserve the last 512 bytes (may hold the RGB565 fast palette) and
+    // keep each bank's pixel data 16-byte aligned like the serial path.
+    iRowBytes = pPage->iPitch + 1;
+    pBank[0] = pBank[1] = NULL;
+    {
+        int iRows = PNG_PIPELINE_ROWS;
+        int iMaxRows = (int)((sizeof(pPage->ucPixels) - 512 - 32) / iRowBytes);
+        if (iRows > iMaxRows / 2)
+            iRows = iMaxRows / 2; // shrink the banks to fit the arena
+        if (iRows >= 2) { // enough room for double buffering
+            uintptr_t uAddr = (uintptr_t)&pPage->ucPixels[0];
+            uAddr += (16 - ((uAddr + 1) & 15)) & 15;
+            pBank[0] = (uint8_t *)uAddr;
+            uAddr += iRows * iRowBytes;
+            uAddr += (16 - ((uAddr + 1) & 15)) & 15;
+            pBank[1] = (uint8_t *)uAddr;
+            iPipeRows = iRows;
+            memset(pBank[1], 0, iRowBytes); // row 0's "previous" line is all zeros
+            pPrevRow = pBank[1];
+        } // else: not enough room - fall back to the serial path
+    }
+#endif
     pPage->iError = PNG_SUCCESS;
     // Start decoding the image
     bDone = FALSE;
@@ -963,12 +1027,76 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
             //        }
                     err = 0;
                     while (err == Z_OK) {
-                        if (d_stream.avail_out == 0) { // reset for next line
-                            d_stream.avail_out = pPage->iPitch+1;
-                            d_stream.next_out = pCurr;
-                        } // otherwise it could be a continuation of an unfinished line
+                        if (d_stream.avail_out == 0) { // reset for next line/bank
+#if PNG_ROW_PIPELINE
+                            if (iPipeRows) {
+                                int iRows = pPage->iHeight - y;
+                                if (iRows == 0) { // all rows inflated; stop here
+                                    bDone = TRUE;
+                                    break;
+                                }
+                                if (iRows > iPipeRows)
+                                    iRows = iPipeRows;
+                                d_stream.avail_out = iRows * iRowBytes;
+                                d_stream.next_out = pBank[iBank];
+                            } else
+#endif
+                            {
+                                d_stream.avail_out = pPage->iPitch+1;
+                                d_stream.next_out = pCurr;
+                            }
+                        } // otherwise it could be a continuation of an unfinished line/bank
                         err = inflate(&d_stream, Z_NO_FLUSH, iOptions & PNG_CHECK_CRC);
-                        if ((err == Z_OK || err == Z_STREAM_END) && d_stream.avail_out == 0) {// successfully decoded line
+                        if ((err == Z_OK || err == Z_STREAM_END) && d_stream.avail_out == 0) {// successfully decoded line/bank
+#if PNG_ROW_PIPELINE
+                            if (iPipeRows) {
+                                // A full bank of rows has been inflated. Run the two
+                                // post-inflate stages on it while the other bank holds
+                                // the previous de-filtered rows for reference:
+                                int i, iRows = pPage->iHeight - y;
+                                uint8_t *pRow;
+                                if (iRows > iPipeRows)
+                                    iRows = iPipeRows;
+                                // stage 1: de-filter every row of the bank (in place)
+                                pRow = pBank[iBank];
+                                for (i = 0; i < iRows; i++) {
+                                    DeFilter(pRow, pPrevRow, pPage->iWidth, pPage->iPitch);
+                                    pPrevRow = pRow;
+                                    pRow += iRowBytes;
+                                }
+                                // stage 2: copy the finished rows to the output
+                                pRow = pBank[iBank];
+                                for (i = 0; i < iRows; i++) {
+                                    if (pPage->pImage == NULL) { // no image buffer, send it line by line
+                                        PNGDRAW pngd;
+                                        pngd.pUser = pUser;
+                                        pngd.iPitch = pPage->iPitch;
+                                        pngd.iWidth = pPage->iWidth;
+                                        pngd.pPalette = pPage->ucPalette;
+                                        pngd.pFastPalette = (iOptions & PNG_FAST_PALETTE) ? (uint16_t *)&pPage->ucPixels[sizeof(pPage->ucPixels)-512] : NULL;
+                                        pngd.pPixels = pRow+1;
+                                        pngd.iPixelType = pPage->ucPixelType;
+                                        pngd.iHasAlpha = pPage->iHasAlpha;
+                                        pngd.iBpp = pPage->ucBpp;
+                                        pngd.y = y;
+                                        if (!(*pPage->pfnDraw)(&pngd)) {
+                                            pPage->iError = PNG_QUIT_EARLY;
+                                            bDone = TRUE;
+                                            break;
+                                        }
+                                    } else {
+                                        // copy to destination bitmap
+                                        memcpy(&pPage->pImage[y * pPage->iPitch], &pRow[1], pPage->iPitch);
+                                    }
+                                    y++;
+                                    pRow += iRowBytes;
+                                }
+                                iBank ^= 1; // alternate banks
+                                if (bDone)
+                                    break;
+                            } else
+#endif
+                            {
                             DeFilter(pCurr, pPrev, pPage->iWidth, pPage->iPitch);
                             if (pPage->pImage == NULL) { // no image buffer, send it line by line
                                 PNGDRAW pngd;
@@ -993,6 +1121,7 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                             y++;
                         // swap current and previous lines
                         tmp = pCurr; pCurr = pPrev; pPrev = tmp;
+                            }
                         } else { // some error
                             tmp = NULL;
                         }
