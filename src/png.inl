@@ -577,6 +577,79 @@ PNG_STATIC void PNGRGB565(PNGDRAW *pDraw, uint16_t *pPixels, int iEndiannes, uin
             break;
     }
 } /* PNGRGB565() */
+
+//
+// Scale selectors for PNG_getLineAsU16()
+// PNG_SCALE_TRUNCATE: keep the most significant 8 bits (high-byte cutoff)
+// PNG_SCALE_ROUND: round to nearest, ties round up (add 128 before shifting)
+//
+#ifndef PNG_SCALE_TRUNCATE
+#define PNG_SCALE_TRUNCATE 0
+#define PNG_SCALE_ROUND 1
+#endif
+
+//
+// Convert a line of native PNG pixels into unsigned short (16-bit) samples
+// without ever passing through an 8-bit intermediate.
+// - 16-bit grayscale (type 0) / truecolor (type 2): full 16-bit samples are
+//   copied byte-for-byte (PNG stores samples big-endian), or reduced to 8
+//   bits placed in the low byte using truncation or rounding.
+// - 8-bit grayscale/truecolor: native 8-bit samples are zero-extended to
+//   unsigned short so the existing 8-bit path stays untouched.
+// iOutBpp must be 8 or 16; iScale is one of the PNG_SCALE_* values and is
+// only meaningful when reducing 16-bit source samples to 8 bits.
+// Returns the number of unsigned short samples written, or -1 for an
+// invalid parameter / unsupported pixel type and bit depth combination.
+//
+#ifdef __cplusplus
+extern "C"
+#endif
+int PNG_getLineAsU16(PNGDRAW *pDraw, uint16_t *pPixels, int iOutBpp, int iScale)
+{
+    int x, iCount;
+    uint8_t *s;
+    uint16_t *d = pPixels;
+
+    if (pDraw == NULL || pPixels == NULL)
+        return -1;
+    if (iOutBpp != 8 && iOutBpp != 16)
+        return -1;
+    if (pDraw->iPixelType != PNG_PIXEL_GRAYSCALE &&
+        pDraw->iPixelType != PNG_PIXEL_TRUECOLOR)
+        return -1;
+    if (pDraw->iBpp != 16 && pDraw->iBpp != 8)
+        return -1;
+    if (pDraw->iBpp == 8 && iOutBpp != 16)
+        return -1; // 8-bit source can only be zero-extended to 16-bit
+
+    if (pDraw->iBpp == 16) {
+        int iChannels = (pDraw->iPixelType == PNG_PIXEL_TRUECOLOR) ? 3 : 1;
+        s = pDraw->pPixels;
+        iCount = pDraw->iWidth * iChannels;
+        for (x = 0; x < iCount; x++) {
+            uint16_t u16Sample = (uint16_t)((s[0] << 8) | s[1]);
+            s += 2;
+            if (iOutBpp == 16) {
+                *d++ = u16Sample; // full 16-bit, no 8-bit intermediate
+            } else if (iScale == PNG_SCALE_ROUND) {
+                uint16_t u8 = (uint16_t)((u16Sample + 128) >> 8);
+                if (u8 > 255) u8 = 255; // 65535 would otherwise round to 256
+                *d++ = u8;
+            } else {
+                *d++ = (uint16_t)(u16Sample >> 8);
+            }
+        }
+    } else { // native 8-bit source, zero-extend each sample
+        int iChannels = (pDraw->iPixelType == PNG_PIXEL_TRUECOLOR) ? 3 : 1;
+        s = pDraw->pPixels;
+        iCount = pDraw->iWidth * iChannels;
+        for (x = 0; x < iCount; x++) {
+            *d++ = (uint16_t)(*s++);
+        }
+    }
+    return iCount;
+} /* PNG_getLineAsU16() */
+
 //
 // Helper functions for memory based images
 //
@@ -658,7 +731,18 @@ PNG_STATIC int PNGParseInfo(PNGIMAGE *pPage)
         pPage->ucBpp = s[24]; // bits per pixel
         pPage->ucPixelType = s[25]; // pixel type
         pPage->iInterlaced = s[28];
-        if (pPage->iInterlaced || pPage->ucBpp > 8) { // 16-bit pixels are not supported (yet)
+        if (pPage->iInterlaced) { // interlaced images are not supported
+            pPage->iError = PNG_UNSUPPORTED_FEATURE;
+            return pPage->iError;
+        }
+        if (pPage->ucBpp > 16) { // only up to 16 bits per sample is defined by PNG
+            pPage->iError = PNG_UNSUPPORTED_FEATURE;
+            return pPage->iError;
+        }
+        if (pPage->ucBpp == 16 &&
+            pPage->ucPixelType != PNG_PIXEL_GRAYSCALE &&
+            pPage->ucPixelType != PNG_PIXEL_TRUECOLOR) {
+            // 16-bit samples are only supported for grayscale and truecolor
             pPage->iError = PNG_UNSUPPORTED_FEATURE;
             return pPage->iError;
         }
