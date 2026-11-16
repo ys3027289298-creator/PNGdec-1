@@ -21,6 +21,24 @@
 //
 #include "zlib.h"
 //
+// Optional chunk-level CRC fault tolerance.
+// Two extra decode() option bits are defined here (instead of PNGdec.h) so
+// that the public header and all existing API signatures remain unchanged:
+//   PNG_TOLERATE_CRC (4) - verify the CRC of each chunk while decoding;
+//                          chunks with a bad CRC are skipped and the scan
+//                          lines they contained are synthesized (see below)
+//                          instead of failing the whole decode.
+//   PNG_FILL_ZERO    (8) - fill synthesized lines with zeros; when clear,
+//                          each missing line is filled by replicating the
+//                          previous (neighboring) decoded line.
+// When PNG_TOLERATE_CRC is not set, decoding behaves exactly as before.
+// Statistics of the most recent decode are exposed through these globals:
+//
+#define PNG_TOLERATE_CRC 4
+#define PNG_FILL_ZERO 8
+uint32_t g_pngFilledPixels = 0; // pixels synthesized during the last decode
+uint32_t g_pngSkippedChunks = 0; // chunks skipped due to CRC/read errors
+//
 // Convert 8-bit grayscale into RGB565
 //
 static const uint16_t usGrayTo565[] = {0x0000,0x0000,0x0000,0x0000,0x0020,0x0020,0x0020,0x0020, // 0
@@ -799,6 +817,51 @@ PNG_STATIC int PNGInit(PNGIMAGE *pPNG)
     return PNGParseInfo(pPNG); // gather info for image
 } /* PNGInit() */
 //
+// Fault tolerance helper: synthesize the remaining undecoded lines (from
+// line y to the end of the image). Each missing line is filled either by
+// replicating the previous (neighboring) decoded line or with zeros,
+// depending on the PNG_FILL_ZERO option bit. The lines are delivered
+// through the normal draw callback or image buffer path and counted in
+// g_pngFilledPixels. Returns the new line count (== iHeight).
+//
+PNG_STATIC int PNGFillLines(PNGIMAGE *pPage, void *pUser, int iOptions, int y, uint8_t *pCurr, uint8_t *pPrev)
+{
+    uint8_t *tmp;
+    while (y < pPage->iHeight) {
+        if ((iOptions & PNG_FILL_ZERO) || y == 0) {
+            memset(&pCurr[1], 0, pPage->iPitch); // no neighbor available: black
+        } else {
+            memcpy(&pCurr[1], &pPrev[1], pPage->iPitch); // replicate previous line
+        }
+        pCurr[0] = 0; // filter byte (unused; no de-filtering needed)
+        if (pPage->pImage == NULL) { // no image buffer, send it line by line
+            PNGDRAW pngd;
+            pngd.pUser = pUser;
+            pngd.iPitch = pPage->iPitch;
+            pngd.iWidth = pPage->iWidth;
+            pngd.pPalette = pPage->ucPalette;
+            pngd.pFastPalette = (iOptions & PNG_FAST_PALETTE) ? (uint16_t *)&pPage->ucPixels[sizeof(pPage->ucPixels)-512] : NULL;
+            pngd.pPixels = pCurr+1;
+            pngd.iPixelType = pPage->ucPixelType;
+            pngd.iHasAlpha = pPage->iHasAlpha;
+            pngd.iBpp = pPage->ucBpp;
+            pngd.y = y;
+            if (!(*pPage->pfnDraw)(&pngd)) {
+                pPage->iError = PNG_QUIT_EARLY;
+                return y;
+            }
+        } else {
+            // copy to destination bitmap
+            memcpy(&pPage->pImage[y * pPage->iPitch], &pCurr[1], pPage->iPitch);
+        }
+        g_pngFilledPixels += pPage->iWidth;
+        y++;
+        // swap current and previous lines so the next fill sees this line
+        tmp = pCurr; pCurr = pPrev; pPrev = tmp;
+    }
+    return y;
+} /* PNGFillLines() */
+//
 // Decode the PNG file
 //
 // You must call open() before calling decode()
@@ -814,6 +877,9 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
     z_stream d_stream; /* decompression stream */
     uint8_t *s = pPage->ucFileBuf;
     struct inflate_state *state;
+
+    g_pngFilledPixels = 0; // reset fault-tolerance stats for this decode
+    g_pngSkippedChunks = 0;
     
     // Either the image buffer must be allocated or a draw callback must be set before entering
     if (pPage->pImage == NULL && pPage->pfnDraw == NULL) {
@@ -875,12 +941,30 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
         iLen = MOTOLONG(&s[iOffset]); // chunk length
         if (iLen < 0 || iLen + (iFileOffset - iBytesRead) > pPage->PNGFile.iSize) // invalid data
         {
+            if (iOptions & PNG_TOLERATE_CRC) { // truncated file: fill the missing lines and stop
+                g_pngSkippedChunks++;
+                PNGFillLines(pPage, pUser, iOptions, y, pCurr, pPrev);
+                y = pPage->iHeight;
+                bDone = TRUE;
+                break;
+            }
             pPage->iError = PNG_DECODE_ERROR;
             return 1;
         }
         iMarker = MOTOLONG(&s[iOffset+4]);
         iOffset += 8; // point to the marker data
         iAvailable = iBytesRead - iOffset;
+        if ((iOptions & PNG_TOLERATE_CRC) && iMarker != 0x49444154 && iLen + 4 <= iAvailable) {
+            // Fault tolerance: verify this (non-IDAT) chunk's CRC before using
+            // its data; if it's corrupt, skip it and continue with the next one.
+            uint32_t u32CRC = (uint32_t)crc32(0, &s[iOffset-4], 4);
+            u32CRC = (uint32_t)crc32(u32CRC, &s[iOffset], iLen);
+            if (u32CRC != (uint32_t)MOTOLONG(&s[iOffset + iLen])) {
+                g_pngSkippedChunks++;
+                iOffset += (iLen + 4); // skip the corrupt chunk
+                continue;
+            }
+        }
         switch (iMarker)
         {
             case 0x44474b62: // 'bKGD' DEBUG
@@ -933,6 +1017,41 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                 }
                 break;
             case 0x49444154: //'IDAT' image data block
+                if ((iOptions & PNG_TOLERATE_CRC) && iLen > 0) {
+                    // Fault tolerance: verify this chunk's CRC before trusting
+                    // its contents. The chunk is streamed through the file
+                    // buffer, then the file position and buffer bookkeeping
+                    // are restored so the normal decode path re-reads it.
+                    int iDataStart = (iFileOffset - iBytesRead) + iOffset;
+                    int iRemaining = iLen, iGot, iBad = 0;
+                    uint32_t u32CRC = (uint32_t)crc32(0, &s[iOffset-4], 4);
+                    (*pPage->pfnSeek)(&pPage->PNGFile, iDataStart);
+                    while (iRemaining > 0) {
+                        int iWant = (iRemaining > PNG_FILE_BUF_SIZE) ? PNG_FILE_BUF_SIZE : iRemaining;
+                        iGot = (*pPage->pfnRead)(&pPage->PNGFile, pPage->ucFileBuf, iWant);
+                        if (iGot <= 0) { iBad = 1; break; } // truncated chunk
+                        u32CRC = (uint32_t)crc32(u32CRC, pPage->ucFileBuf, iGot);
+                        iRemaining -= iGot;
+                    }
+                    if (!iBad) {
+                        uint8_t ucCRC[4];
+                        if ((*pPage->pfnRead)(&pPage->PNGFile, ucCRC, 4) != 4 ||
+                            u32CRC != (uint32_t)MOTOLONG(ucCRC))
+                            iBad = 1; // CRC mismatch or missing CRC
+                    }
+                    // restore the file position to the start of the chunk data
+                    (*pPage->pfnSeek)(&pPage->PNGFile, iDataStart);
+                    iFileOffset = iDataStart;
+                    iOffset = 0;
+                    iBytesRead = 0;
+                    if (iBad) { // corrupt or truncated IDAT: skip it, fill the missing lines
+                        g_pngSkippedChunks++;
+                        PNGFillLines(pPage, pUser, iOptions, y, pCurr, pPrev);
+                        y = pPage->iHeight;
+                        bDone = TRUE;
+                        break;
+                    }
+                }
                 while (iLen) {
                     if (iOffset >= iBytesRead) {
                         // we ran out of data; get some more
@@ -1002,10 +1121,17 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                         y = pPage->iHeight;
                         bDone = TRUE;
                     } else  if (err == Z_DATA_ERROR || err == Z_STREAM_ERROR) {
-                        iLen = 0; // quit now
-                        y = pPage->iHeight;
-                        pPage->iError = PNG_DECODE_ERROR;
-                        bDone = TRUE; // force loop to exit with error
+                        if (iOptions & PNG_TOLERATE_CRC) { // bad stream: fill the rest and finish gracefully
+                            g_pngSkippedChunks++;
+                            PNGFillLines(pPage, pUser, iOptions, y, pCurr, pPrev);
+                            y = pPage->iHeight;
+                            bDone = TRUE;
+                        } else {
+                            iLen = 0; // quit now
+                            y = pPage->iHeight;
+                            pPage->iError = PNG_DECODE_ERROR;
+                            bDone = TRUE; // force loop to exit with error
+                        }
                     } else if (err == Z_BUF_ERROR) {
                         y |= 0; // need more data
                     }
