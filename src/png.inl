@@ -1053,3 +1053,468 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
     err = inflateEnd(&d_stream);
     return pPage->iError;
 } /* DecodePNG() */
+
+//===========================================================================
+//
+// Decode-time color quantization (median-cut)
+//
+// Accumulates a color histogram while the PNG is decoded, then builds a
+// palette of the requested size and performs a second decode pass which
+// maps every pixel to the nearest palette index. No malloc/free is used;
+// all working storage lives inside the caller-supplied PNGQUANT struct.
+// The normal DecodePNG() pixel path is not modified.
+//
+//===========================================================================
+#ifdef __cplusplus
+#ifndef PNG_QUANT_HASH_SIZE
+#define PNG_QUANT_HASH_SIZE 2048 // must be a power of 2; override for small-RAM MCUs
+#endif
+#define PNG_QUANT_MIN_COLORS 2
+#define PNG_QUANT_MAX_COLORS 256
+#define PNG_QUANT_ALPHA_THRESHOLD 128
+
+typedef struct png_quant_bucket_tag
+{
+    uint32_t u32Key;   // stored as 0x01RRGGBB (bit 24 set) so black (RGB 0)
+                       // never collides with the empty-slot value 0
+    uint32_t u32Count; // number of pixels of this exact color
+} PNGQUANTBUCKET;
+
+typedef struct png_quant_box_tag
+{
+    int iStart, iCount; // range of buckets assigned to this box
+} PNGQUANTBOX;
+
+typedef struct png_quant_tag
+{
+    PNGIMAGE *pPNG;
+    int iColors;           // target palette size
+    int iKeepTransparent;  // reserve palette index 0 for transparency
+    int iPass;             // 1 = histogram, 2 = index mapping
+    int iTransparentCount; // pixels treated as transparent
+    uint32_t u32PixelCount;
+    uint64_t u64SumSqError;
+    PNGQUANTBUCKET buckets[PNG_QUANT_HASH_SIZE];
+    PNGQUANTBUCKET items[PNG_QUANT_HASH_SIZE];
+    PNGQUANTBOX boxes[PNG_QUANT_MAX_COLORS];
+    uint8_t ucPalette[PNG_QUANT_MAX_COLORS * 3]; // RR GG BB per index
+    uint8_t *pIndices;      // output index image (w*h bytes)
+    int iIndexCount;
+    int iWidth, iHeight;
+} PNGQUANT;
+
+//
+// Extract one pixel as 0x00RRGGBB plus an alpha flag from a decoded line.
+// Reuses the exact unpacking semantics of PNGRGB565()/PNGMakeMask().
+//
+PNG_STATIC void PNGQuantExtract(PNGDRAW *pDraw, int x, uint32_t *pu32RGB, int *pTransparent)
+{
+    uint8_t *s = pDraw->pPixels;
+    int iTransparent = 0;
+    uint32_t u32RGB = 0;
+    int iBpp = pDraw->iBpp;
+
+    switch (pDraw->iPixelType)
+    {
+        case PNG_PIXEL_GRAYSCALE:
+        {
+            uint8_t c;
+            if (iBpp == 8) {
+                c = s[x];
+            } else {
+                int iPixelsPerByte = 8 / iBpp;
+                int iByte = x / iPixelsPerByte;
+                int iShift = 8 - iBpp - (x % iPixelsPerByte) * iBpp;
+                c = (uint8_t)((s[iByte] >> iShift) & ((1 << iBpp) - 1));
+                c = (uint8_t)((c * 255) / ((1 << iBpp) - 1)); // PNG sample scaling
+            }
+            u32RGB = ((uint32_t)c << 16) | ((uint32_t)c << 8) | c;
+            break;
+        }
+        case PNG_PIXEL_GRAY_ALPHA:
+        {
+            uint8_t c = s[x * 2];
+            uint8_t a = s[x * 2 + 1];
+            if (a < PNG_QUANT_ALPHA_THRESHOLD) iTransparent = 1;
+            u32RGB = ((uint32_t)c << 16) | ((uint32_t)c << 8) | c;
+            break;
+        }
+        case PNG_PIXEL_TRUECOLOR:
+        {
+            uint8_t *p = &s[x * 3];
+            u32RGB = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+            break;
+        }
+        case PNG_PIXEL_TRUECOLOR_ALPHA:
+        {
+            uint8_t *p = &s[x * 4];
+            uint8_t a = p[3];
+            if (a < PNG_QUANT_ALPHA_THRESHOLD) iTransparent = 1;
+            u32RGB = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+            break;
+        }
+        default: // PNG_PIXEL_INDEXED
+        {
+            uint8_t idx;
+            if (iBpp == 8) {
+                idx = s[x];
+            } else {
+                int iPixelsPerByte = 8 / iBpp;
+                int iByte = x / iPixelsPerByte;
+                int iShift = 8 - iBpp - (x % iPixelsPerByte) * iBpp;
+                idx = (uint8_t)((s[iByte] >> iShift) & ((1 << iBpp) - 1));
+            }
+            uint8_t *pPal = &pDraw->pPalette[idx * 3];
+            u32RGB = ((uint32_t)pPal[0] << 16) | ((uint32_t)pPal[1] << 8) | pPal[2];
+            if (pDraw->iHasAlpha && pDraw->pPalette[768 + idx] < PNG_QUANT_ALPHA_THRESHOLD)
+                iTransparent = 1;
+            break;
+        }
+    } // switch
+
+    // tRNS on grayscale / truecolor stores a transparent source color value
+    if (!iTransparent && pDraw->iHasAlpha &&
+        (pDraw->iPixelType == PNG_PIXEL_GRAYSCALE || pDraw->iPixelType == PNG_PIXEL_TRUECOLOR))
+    {
+        PNGQUANT *pQ = (PNGQUANT *)pDraw->pUser;
+        uint32_t u32Trans = pQ->pPNG->iTransparent; // 0x00RRGGBB (truecolor) or a gray value
+        if (pDraw->iPixelType == PNG_PIXEL_GRAYSCALE)
+        {
+            uint32_t g = u32Trans & 0xff;
+            u32Trans = (g << 16) | (g << 8) | g;
+        }
+        if (u32Trans == u32RGB)
+            iTransparent = 1;
+    }
+    *pu32RGB = u32RGB;
+    *pTransparent = iTransparent;
+} /* PNGQuantExtract() */
+
+//
+// Insert (or accumulate) a color in the open-addressing histogram.
+// A full table cannot happen for supported images, but if it ever does the
+// pixel is folded into its nearest existing color so output stays exact.
+//
+PNG_STATIC void PNGQuantInsert(PNGQUANT *pQ, uint32_t u32Key)
+{
+    uint32_t u32Mask = PNG_QUANT_HASH_SIZE - 1;
+    uint32_t i = (u32Key * 2654435761u) & u32Mask;
+    int iTries;
+    for (iTries = 0; iTries < PNG_QUANT_HASH_SIZE; iTries++)
+    {
+        PNGQUANTBUCKET *pB = &pQ->buckets[i];
+        if (pB->u32Key == u32Key) { pB->u32Count++; return; }
+        if (pB->u32Key == 0) { pB->u32Key = u32Key; pB->u32Count = 1; return; }
+        i = (i + 1) & u32Mask;
+    }
+    // overflow fallback: nearest color (extremely unlikely for target MCUs)
+    uint32_t u32Best = 0;
+    int iBest = 1 << 30;
+    int r1 = (int)((u32Key >> 16) & 0xff), g1 = (int)((u32Key >> 8) & 0xff), b1 = (int)(u32Key & 0xff);
+    for (i = 0; i < PNG_QUANT_HASH_SIZE; i++)
+    {
+        uint32_t k = pQ->buckets[i].u32Key;
+        if (k == 0) continue;
+        int d = (r1 - (int)((k >> 16) & 0xff)) * (r1 - (int)((k >> 16) & 0xff))
+              + (g1 - (int)((k >> 8) & 0xff)) * (g1 - (int)((k >> 8) & 0xff))
+              + (b1 - (int)(k & 0xff)) * (b1 - (int)(k & 0xff));
+        if (d < iBest) { iBest = d; u32Best = i; }
+    }
+    pQ->buckets[u32Best].u32Count++;
+} /* PNGQuantInsert() */
+
+//
+// Nearest-palette lookup for the index pass
+//
+PNG_STATIC uint8_t PNGQuantNearest(PNGQUANT *pQ, uint32_t u32Key)
+{
+    int i, iBest = 0, iBestDist = 1 << 30;
+    int r1 = (int)((u32Key >> 16) & 0xff), g1 = (int)((u32Key >> 8) & 0xff), b1 = (int)(u32Key & 0xff);
+    int iFirst = pQ->iKeepTransparent ? 1 : 0;
+    for (i = iFirst; i < pQ->iColors; i++)
+    {
+        uint8_t *p = &pQ->ucPalette[i * 3];
+        int d = (r1 - p[0]) * (r1 - p[0]) + (g1 - p[1]) * (g1 - p[1]) + (b1 - p[2]) * (b1 - p[2]);
+        if (d < iBestDist) { iBestDist = d; iBest = i; }
+    }
+    return (uint8_t)iBest;
+} /* PNGQuantNearest() */
+
+//
+// Split a box on one RGB channel at its median, using an unweighted
+// quickselect (average O(n), termination guaranteed by Hoare partitioning).
+// Returns the absolute items[] index of the right-hand box, or -1 when
+// the channel holds a single distinct value and cannot be split.
+//
+PNG_STATIC int PNGQuantChannelSplit(PNGQUANTBUCKET *pItems, PNGQUANTBOX *pBox, int iChannel)
+{
+    int iShift = 16 - iChannel * 8;
+    int iLeft = pBox->iStart;
+    int iRight = pBox->iStart + pBox->iCount - 1;
+    int iTarget = iLeft + pBox->iCount / 2;
+    int i, iCut;
+
+    while (iLeft < iRight)
+    {
+        uint32_t u32Pivot = (pItems[(iLeft + iRight) / 2].u32Key >> iShift) & 0xff;
+        int i = iLeft, j = iRight;
+        do {
+            while (((pItems[i].u32Key >> iShift) & 0xff) < u32Pivot) i++;
+            while (((pItems[j].u32Key >> iShift) & 0xff) > u32Pivot) j--;
+            if (i <= j)
+            {
+                PNGQUANTBUCKET temp = pItems[i];
+                pItems[i] = pItems[j];
+                pItems[j] = temp;
+                i++; j--;
+            }
+        } while (i <= j);
+        if (iTarget <= j)
+            iRight = j;
+        else if (iTarget >= i)
+            iLeft = i;
+        else
+            break;
+    }
+    iCut = iTarget;
+    if (iCut <= pBox->iStart || iCut > pBox->iStart + pBox->iCount - 1)
+        return -1;
+    // Refuse a split that divides the channel into a single distinct value
+    uint32_t u32Left = (pItems[pBox->iStart].u32Key >> iShift) & 0xff;
+    for (i = pBox->iStart + 1; i < iCut; i++)
+    {
+        if (((pItems[i].u32Key >> iShift) & 0xff) != u32Left) return iCut;
+    }
+    if (((pItems[iCut].u32Key >> iShift) & 0xff) == u32Left)
+        return -1;
+    return iCut;
+} /* PNGQuantChannelSplit() */
+
+//
+// Build the palette from the histogram with median-cut: split the box with
+// the largest channel range at its median until the target size is reached,
+// then average each box's colors weighted by their pixel counts.
+//
+PNG_STATIC void PNGQuantBuildPalette(PNGQUANT *pQ)
+{
+    int i, iDistinct = 0;
+    for (i = 0; i < PNG_QUANT_HASH_SIZE; i++)
+    {
+        if (pQ->buckets[i].u32Key != 0)
+            pQ->items[iDistinct++] = pQ->buckets[i];
+    }
+    int iFirstIndex = pQ->iKeepTransparent ? 1 : 0;
+    int iTargetBoxes = pQ->iColors - iFirstIndex;
+    if (iTargetBoxes > iDistinct) iTargetBoxes = iDistinct;
+
+    if (iDistinct == 0)
+    {   // only possible when every pixel is transparent and index 0 is reserved
+        memset(pQ->ucPalette, 0, sizeof(pQ->ucPalette));
+        pQ->iColors = iFirstIndex;
+        return;
+    }
+
+    int iBoxCount = 1;
+    pQ->boxes[0].iStart = 0;
+    pQ->boxes[0].iCount = iDistinct;
+
+    while (iBoxCount < iTargetBoxes)
+    {
+        // pick the box with the largest channel range
+        int iBestBox = -1, iBestChannel = 0, iBestRange = -1;
+        for (i = 0; i < iBoxCount; i++)
+        {
+            PNGQUANTBOX *pBox = &pQ->boxes[i];
+            if (pBox->iCount < 2) continue;
+            int ch, lo[3] = {255, 255, 255}, hi[3] = {0, 0, 0};
+            for (ch = 0; ch < 3; ch++)
+            {
+                int k;
+                for (k = pBox->iStart; k < pBox->iStart + pBox->iCount; k++)
+                {
+                    int v = (int)((pQ->items[k].u32Key >> (16 - ch * 8)) & 0xff);
+                    if (v < lo[ch]) lo[ch] = v;
+                    if (v > hi[ch]) hi[ch] = v;
+                }
+                if (hi[ch] - lo[ch] > iBestRange)
+                {
+                    iBestRange = hi[ch] - lo[ch];
+                    iBestBox = i;
+                    iBestChannel = ch;
+                }
+            }
+        }
+        if (iBestBox < 0) break; // nothing left is splittable
+
+        PNGQUANTBOX save = pQ->boxes[iBestBox];
+        int iCut = PNGQuantChannelSplit(pQ->items, &save, iBestChannel);
+        if (iCut < 0 || iCut >= save.iStart + save.iCount) break;
+
+        int iLeftCount = iCut - save.iStart;
+        pQ->boxes[iBestBox].iStart = save.iStart;
+        pQ->boxes[iBestBox].iCount = iLeftCount;
+        pQ->boxes[iBoxCount].iStart = iCut;
+        pQ->boxes[iBoxCount].iCount = save.iCount - iLeftCount;
+        iBoxCount++;
+    }
+
+    memset(pQ->ucPalette, 0, sizeof(pQ->ucPalette));
+    int iOut = iFirstIndex;
+    for (i = 0; i < iBoxCount && iOut < PNG_QUANT_MAX_COLORS; i++)
+    {
+        PNGQUANTBOX *pBox = &pQ->boxes[i];
+        uint64_t u64SumW = 0, u64SumR = 0, u64SumG = 0, u64SumB = 0;
+        int k;
+        for (k = pBox->iStart; k < pBox->iStart + pBox->iCount; k++)
+        {
+            uint32_t w = pQ->items[k].u32Count;
+            u64SumW += w;
+            u64SumR += (uint64_t)((pQ->items[k].u32Key >> 16) & 0xff) * w;
+            u64SumG += (uint64_t)((pQ->items[k].u32Key >> 8) & 0xff) * w;
+            u64SumB += (uint64_t)(pQ->items[k].u32Key & 0xff) * w;
+        }
+        if (u64SumW == 0) continue;
+        pQ->ucPalette[iOut * 3 + 0] = (uint8_t)((u64SumR + u64SumW / 2) / u64SumW);
+        pQ->ucPalette[iOut * 3 + 1] = (uint8_t)((u64SumG + u64SumW / 2) / u64SumW);
+        pQ->ucPalette[iOut * 3 + 2] = (uint8_t)((u64SumB + u64SumW / 2) / u64SumW);
+        iOut++;
+    }
+    pQ->iColors = iOut; // actual palette size (may be below the target)
+} /* PNGQuantBuildPalette() */
+
+//
+// Internal line callback shared by both quantization passes
+//
+PNG_STATIC int PNGQuantDraw(PNGDRAW *pDraw)
+{
+    PNGQUANT *pQ = (PNGQUANT *)pDraw->pUser;
+    int x, y = pDraw->y;
+    int iWidth = pDraw->iWidth;
+
+    for (x = 0; x < iWidth; x++)
+    {
+        uint32_t u32RGB;
+        int iTransparent;
+        PNGQuantExtract(pDraw, x, &u32RGB, &iTransparent);
+
+        if (pQ->iPass == 1)
+        {
+            pQ->u32PixelCount++;
+            if (iTransparent)
+            {
+                pQ->iTransparentCount++;
+                if (pQ->iKeepTransparent) continue; // index 0 reserved, not histogrammed
+            }
+            PNGQuantInsert(pQ, u32RGB | 0x01000000);
+        }
+        else
+        {
+            int iPixelPos = y * iWidth + x;
+            if (iTransparent && pQ->iKeepTransparent)
+            {
+                pQ->pIndices[iPixelPos] = 0;
+                continue; // reserved index: defined as an exact match
+            }
+            uint8_t ucIndex = PNGQuantNearest(pQ, u32RGB);
+            pQ->pIndices[iPixelPos] = ucIndex;
+            uint8_t *p = &pQ->ucPalette[ucIndex * 3];
+            int dr = (int)((u32RGB >> 16) & 0xff) - p[0];
+            int dg = (int)((u32RGB >> 8) & 0xff) - p[1];
+            int db = (int)(u32RGB & 0xff) - p[2];
+            pQ->u64SumSqError += (uint64_t)(dr * dr + dg * dg + db * db);
+        }
+    }
+    return 1;
+} /* PNGQuantDraw() */
+
+//
+// Decode a memory-based PNG and produce a palette + index image.
+// Returns PNG_SUCCESS or a PNG_* error code. iColors out of range
+// (outside [2,256]) or bad pointers return PNG_INVALID_PARAMETER.
+//
+PNG_STATIC int PNGQuantDecodeRAM(PNGQUANT *pQ, uint8_t *pData, int iDataSize,
+                                 int iColors, int iKeepTransparent, uint8_t *pIndices)
+{
+    int rc;
+    if (pQ == NULL || pData == NULL || pIndices == NULL ||
+        iColors < PNG_QUANT_MIN_COLORS || iColors > PNG_QUANT_MAX_COLORS)
+        return PNG_INVALID_PARAMETER;
+
+    memset(pQ, 0, sizeof(PNGQUANT));
+    pQ->iColors = iColors;
+    pQ->iKeepTransparent = iKeepTransparent ? 1 : 0;
+    pQ->pIndices = pIndices;
+    pQ->iPass = 1;
+
+    PNGIMAGE pngimg;
+    memset(&pngimg, 0, sizeof(pngimg));
+    pngimg.ucMemType = PNG_MEM_RAM;
+    pngimg.pfnRead = readRAM;
+    pngimg.pfnSeek = seekMem;
+    pngimg.pfnDraw = PNGQuantDraw;
+    pngimg.PNGFile.iSize = iDataSize;
+    pngimg.PNGFile.pData = pData;
+    pQ->pPNG = &pngimg;
+
+    rc = PNGInit(&pngimg);
+    if (rc != PNG_SUCCESS) return rc;
+
+    // Pass 1: decode while accumulating the color histogram
+    rc = DecodePNG(&pngimg, pQ, 0);
+    if (rc != PNG_SUCCESS) return rc;
+
+    PNGQuantBuildPalette(pQ);
+    if (pQ->iColors <= 0)
+        return PNG_DECODE_ERROR;
+
+    // Pass 2: re-decode and map every pixel to a palette index
+    pQ->iPass = 2;
+    pQ->iIndexCount = pngimg.iWidth * pngimg.iHeight;
+    pQ->iWidth = pngimg.iWidth;
+    pQ->iHeight = pngimg.iHeight;
+    rc = DecodePNG(&pngimg, pQ, 0);
+    return rc;
+} /* PNGQuantDecodeRAM() */
+
+PNG_STATIC int PNGQuantDecodeFLASH(PNGQUANT *pQ, uint8_t *pData, int iDataSize,
+                                   int iColors, int iKeepTransparent, uint8_t *pIndices)
+{
+    int rc;
+    if (pQ == NULL || pData == NULL || pIndices == NULL ||
+        iColors < PNG_QUANT_MIN_COLORS || iColors > PNG_QUANT_MAX_COLORS)
+        return PNG_INVALID_PARAMETER;
+
+    memset(pQ, 0, sizeof(PNGQUANT));
+    pQ->iColors = iColors;
+    pQ->iKeepTransparent = iKeepTransparent ? 1 : 0;
+    pQ->pIndices = pIndices;
+    pQ->iPass = 1;
+
+    PNGIMAGE pngimg;
+    memset(&pngimg, 0, sizeof(pngimg));
+    pngimg.ucMemType = PNG_MEM_FLASH;
+    pngimg.pfnRead = readFLASH;
+    pngimg.pfnSeek = seekMem;
+    pngimg.pfnDraw = PNGQuantDraw;
+    pngimg.PNGFile.iSize = iDataSize;
+    pngimg.PNGFile.pData = pData;
+    pQ->pPNG = &pngimg;
+
+    rc = PNGInit(&pngimg);
+    if (rc != PNG_SUCCESS) return rc;
+
+    rc = DecodePNG(&pngimg, pQ, 0);
+    if (rc != PNG_SUCCESS) return rc;
+
+    PNGQuantBuildPalette(pQ);
+    if (pQ->iColors <= (pQ->iKeepTransparent ? 1 : 0))
+        return PNG_DECODE_ERROR;
+
+    pQ->iPass = 2;
+    pQ->iIndexCount = pngimg.iWidth * pngimg.iHeight;
+    pQ->iWidth = pngimg.iWidth;
+    pQ->iHeight = pngimg.iHeight;
+    rc = DecodePNG(&pngimg, pQ, 0);
+    return rc;
+} /* PNGQuantDecodeFLASH() */
+#endif // __cplusplus
