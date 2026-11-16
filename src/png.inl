@@ -616,6 +616,226 @@ PNG_STATIC int32_t readRAM(PNGFILE *pFile, uint8_t *pBuf, int32_t iLen)
     return iBytesRead;
 } /* readRAM() */
 //
+// ROI (region of interest) decode extension
+//
+// A single rectangle can be associated with a PNGIMAGE. While an ROI is
+// active, DecodePNG() only delivers lines inside the rectangle's row range
+// and the line buffer handed to the draw callback holds only the columns
+// covered by the rectangle. The zlib stream is sequential, so rows above the
+// ROI are still inflated/defiltered to keep the PNG predictor state valid;
+// rows below the ROI are never processed and per-line de-filtering stops at
+// the ROI's right edge. The state lives in a small fixed registry indexed by
+// PNGIMAGE pointer (no malloc/free and no changes to the public structures).
+//
+#ifndef PNG_ROI_MAX_SLOTS
+#define PNG_ROI_MAX_SLOTS 4
+#endif
+
+typedef struct png_roi_rect_tag
+{
+    int x, y, w, h;
+} PNG_ROI_RECT;
+
+typedef struct png_roi_slot_tag
+{
+    PNGIMAGE *pPage;
+    int bActive;
+    PNG_ROI_RECT req; // rectangle requested by the caller
+    PNG_ROI_RECT eff; // rectangle after clamping to the image bounds
+    int iStartByte;   // first pixel byte represented in the delivered buffer
+    int iEndByte;     // one past the last defiltered pixel byte
+    int iDrawX;       // first pixel represented in the delivered buffer
+    int iDrawWidth;   // number of pixels represented in the delivered buffer
+    int iDrawPitch;   // bytes per delivered line span
+} PNG_ROI_SLOT;
+
+static PNG_ROI_SLOT s_PNGROISlots[PNG_ROI_MAX_SLOTS];
+
+// Find the unique slot owned by this object address, or NULL.
+static PNG_ROI_SLOT *PNGROISlotFor(PNGIMAGE *pPage)
+{
+    int i;
+    for (i=0; i<PNG_ROI_MAX_SLOTS; i++) {
+        if (s_PNGROISlots[i].pPage == pPage)
+            return &s_PNGROISlots[i];
+    }
+    return NULL;
+}
+
+//
+// Every open path runs through PNGParseInfo(). Opening an image clears any
+// active ROI recorded for that object, so an ROI set against a previous
+// decode session can never apply to the new one. Object addresses that get
+// reused (stack/heap) simply resolve to the same slot, which the open resets.
+//
+PNG_STATIC void PNGROIBeginOpen(PNGIMAGE *pPage)
+{
+    PNG_ROI_SLOT *pSlot = PNGROISlotFor(pPage);
+    int i;
+    if (pSlot == NULL) {
+        for (i=0; i<PNG_ROI_MAX_SLOTS; i++) {
+            if (s_PNGROISlots[i].pPage == NULL) {
+                pSlot = &s_PNGROISlots[i];
+                pSlot->pPage = pPage;
+                break;
+            }
+        }
+    }
+    if (pSlot != NULL)
+        pSlot->bActive = 0;
+} /* PNGROIBeginOpen() */
+
+PNG_STATIC PNG_ROI_SLOT *PNGROIFind(PNGIMAGE *pPage)
+{
+    PNG_ROI_SLOT *pSlot = PNGROISlotFor(pPage);
+    if (pSlot != NULL && pSlot->bActive)
+        return pSlot;
+    return NULL;
+} /* PNGROIFind() */
+
+// Number of bits occupied by one pixel in the uncompressed scanline
+PNG_STATIC int PNGBitsPerPixel(PNGIMAGE *pPage)
+{
+    int iChannels;
+    switch (pPage->ucPixelType) {
+        case PNG_PIXEL_TRUECOLOR:
+            iChannels = 3;
+            break;
+        case PNG_PIXEL_GRAY_ALPHA:
+            iChannels = 2;
+            break;
+        case PNG_PIXEL_TRUECOLOR_ALPHA:
+            iChannels = 4;
+            break;
+        default:
+            iChannels = 1;
+            break;
+    }
+    return (int)pPage->ucBpp * iChannels;
+} /* PNGBitsPerPixel() */
+
+//
+// Select the region of interest for subsequent decode() calls.
+// The rectangle is clamped to the image bounds; query it back with
+// PNG_getROI()/PNG_getROIDrawGeometry(). Call PNG_resetROI() to decode
+// the full image again. Returns PNG_SUCCESS or PNG_INVALID_PARAMETER.
+//
+int PNG_setROI(PNGIMAGE *pPage, int x, int y, int w, int h)
+{
+    PNG_ROI_SLOT *pSlot;
+    long long x0, y0, x1, y1, cx0, cy0, cx1, cy1;
+    int i, iBits;
+
+    if (pPage == NULL || pPage->iWidth <= 0 || pPage->iHeight <= 0)
+        return PNG_INVALID_PARAMETER;
+    pSlot = PNGROISlotFor(pPage);
+    if (pSlot == NULL) {
+        // Prefer a never-used slot, then reuse one whose ROI is inactive
+        // (an inactive slot cannot be matched by any in-flight decode).
+        for (i=0; i<PNG_ROI_MAX_SLOTS; i++) {
+            if (s_PNGROISlots[i].pPage == NULL) {
+                pSlot = &s_PNGROISlots[i];
+                break;
+            }
+        }
+        if (pSlot == NULL) {
+            for (i=0; i<PNG_ROI_MAX_SLOTS; i++) {
+                if (!s_PNGROISlots[i].bActive) {
+                    pSlot = &s_PNGROISlots[i];
+                    break;
+                }
+            }
+        }
+        if (pSlot == NULL)
+            return PNG_MEM_ERROR; // more active decoders than PNG_ROI_MAX_SLOTS
+        pSlot->pPage = pPage;
+    }
+    pSlot->bActive = 1;
+    pSlot->req.x = x;
+    pSlot->req.y = y;
+    pSlot->req.w = w;
+    pSlot->req.h = h;
+    // Clamp the requested rectangle into the image bounds
+    x0 = (long long)x;
+    y0 = (long long)y;
+    x1 = (long long)x + w;
+    y1 = (long long)y + h;
+    cx0 = x0 < 0 ? 0 : (x0 > pPage->iWidth ? pPage->iWidth : x0);
+    cy0 = y0 < 0 ? 0 : (y0 > pPage->iHeight ? pPage->iHeight : y0);
+    if (w <= 0 || h <= 0) {
+        // An empty request delivers nothing, but stays queryable
+        cx1 = cx0;
+        cy1 = cy0;
+    } else {
+        long long t;
+        t = x1 < 0 ? 0 : (x1 > pPage->iWidth ? pPage->iWidth : x1);
+        cx1 = t < cx0 ? cx0 : t;
+        t = y1 < 0 ? 0 : (y1 > pPage->iHeight ? pPage->iHeight : y1);
+        cy1 = t < cy0 ? cy0 : t;
+    }
+    pSlot->eff.x = (int)cx0;
+    pSlot->eff.y = (int)cy0;
+    pSlot->eff.w = (int)(cx1 - cx0);
+    pSlot->eff.h = (int)(cy1 - cy0);
+    // Translate the pixel rectangle into scanline byte geometry
+    iBits = PNGBitsPerPixel(pPage);
+    pSlot->iStartByte = (int)((cx0 * iBits) / 8);
+    pSlot->iEndByte = (int)((cx1 * iBits + 7) / 8);
+    pSlot->iDrawX = (pSlot->iStartByte * 8) / iBits;
+    pSlot->iDrawWidth = ((pSlot->iEndByte - pSlot->iStartByte) * 8) / iBits;
+    pSlot->iDrawPitch = pSlot->iEndByte - pSlot->iStartByte;
+    return PNG_SUCCESS;
+} /* PNG_setROI() */
+
+//
+// Remove the ROI associated with this image so decode() handles the
+// full image again.
+//
+void PNG_resetROI(PNGIMAGE *pPage)
+{
+    PNG_ROI_SLOT *pSlot = PNGROIFind(pPage);
+    if (pSlot != NULL)
+        pSlot->bActive = 0;
+} /* PNG_resetROI() */
+
+//
+// Query the ROI of an image. Returns 1 when an ROI is active, 0 otherwise.
+// Either rectangle pointer may be NULL. The effective rectangle is the
+// requested one clamped to the image.
+//
+int PNG_getROI(PNGIMAGE *pPage, PNG_ROI_RECT *pRequest, PNG_ROI_RECT *pEffective)
+{
+    PNG_ROI_SLOT *pSlot = PNGROIFind(pPage);
+    if (pSlot == NULL)
+        return 0;
+    if (pRequest)
+        *pRequest = pSlot->req;
+    if (pEffective)
+        *pEffective = pSlot->eff;
+    return 1;
+} /* PNG_getROI() */
+
+//
+// Query the byte geometry of the line buffer delivered during ROI decoding.
+// For byte-per-pixel formats it matches the effective rectangle exactly;
+// for sub-byte formats (1/2/4 bpp) the span is expanded to whole bytes, so
+// iDrawX may be smaller than eff.x and iDrawWidth larger than eff.w.
+// Returns 1 when an ROI is active, 0 otherwise.
+//
+int PNG_getROIDrawGeometry(PNGIMAGE *pPage, int *piDrawX, int *piDrawWidth, int *piDrawPitch)
+{
+    PNG_ROI_SLOT *pSlot = PNGROIFind(pPage);
+    if (pSlot == NULL)
+        return 0;
+    if (piDrawX)
+        *piDrawX = pSlot->iDrawX;
+    if (piDrawWidth)
+        *piDrawWidth = pSlot->iDrawWidth;
+    if (piDrawPitch)
+        *piDrawPitch = pSlot->iDrawPitch;
+    return 1;
+} /* PNG_getROIDrawGeometry() */
+//
 // Verify it's a PNG file and then parse the IHDR chunk
 // to get basic image size/type/etc
 //
@@ -623,7 +843,8 @@ PNG_STATIC int PNGParseInfo(PNGIMAGE *pPage)
 {
     uint8_t *s = pPage->ucFileBuf;
     int iBytesRead;
-    
+
+    PNGROIBeginOpen(pPage); // every open starts a fresh ROI session
     pPage->iHasAlpha = pPage->iInterlaced = 0;
     pPage->szComment[0] = 0;
     // Read a few bytes to just parse the size/pixel info
@@ -789,6 +1010,104 @@ PNG_STATIC void DeFilter(uint8_t *pCurr, uint8_t *pPrev, int iWidth, int iPitch)
     } // switch on filter type
 } /* DeFilter() */
 //
+// De-filter only the first iLimit pixel bytes of a line.
+// Used by ROI decoding: bytes past the ROI's right edge are never
+// delivered, so they don't need to be reconstructed.
+//
+PNG_STATIC void DeFilterLimited(uint8_t *pCurr, uint8_t *pPrev, int iWidth, int iPitch, int iLimit)
+{
+    uint8_t ucFilter = *pCurr++;
+    int x, iBpp;
+    if (iPitch <= iWidth)
+        iBpp = 1;
+    else
+        iBpp = iPitch / iWidth;
+    if (iLimit > iPitch)
+        iLimit = iPitch;
+
+    pPrev++; // skip filter of previous line
+    switch (ucFilter) {
+        case PNG_FILTER_NONE:
+            break;
+        case PNG_FILTER_SUB:
+            for (x=iBpp; x<iLimit; x++) {
+                pCurr[x] += pCurr[x-iBpp];
+            }
+            break;
+        case PNG_FILTER_UP:
+            for (x = 0; x < iLimit; x++) {
+               pCurr[x] += pPrev[x];
+            }
+            break;
+        case PNG_FILTER_AVG:
+            for (x = 0; x < iBpp && x < iLimit; x++) {
+               pCurr[x] = (pCurr[x] +
+                  pPrev[x] / 2 );
+            }
+            for (x = iBpp; x < iLimit; x++) {
+               pCurr[x] = pCurr[x] +
+                  (pPrev[x] + pCurr[x-iBpp]) / 2;
+            }
+            break;
+        case PNG_FILTER_PAETH:
+            if (iBpp == 1) {
+                int a, c;
+                uint8_t *pEnd = &pCurr[iLimit];
+                // First pixel/byte
+                c = *pPrev++;
+                a = *pCurr + c;
+                *pCurr++ = (uint8_t)a;
+                while (pCurr < pEnd) {
+                   int b, pa, pb, pc, p;
+                   a &= 0xff; // From previous iteration
+                   b = *pPrev++;
+                   p = b - c;
+                   pc = a - c;
+                   // assume no native ABS() instruction
+                   pa = p < 0 ? -p : p;
+                   pb = pc < 0 ? -pc : pc;
+                   pc = (p + pc) < 0 ? -(p + pc) : p + pc;
+                   // choose the best predictor
+                   if (pb < pa) {
+                      pa = pb; a = b;
+                   }
+                   if (pc < pa) a = c;
+                   // Calculate current pixel
+                   c = b;
+                   a += *pCurr;
+                   *pCurr++ = (uint8_t)a;
+                }
+            } else { // multi-byte
+                uint8_t *pEnd = &pCurr[iBpp < iLimit ? iBpp : iLimit];
+                // first pixel is treated the same as 'up'
+                while (pCurr < pEnd) {
+                   int a = *pCurr + *pPrev++;
+                   *pCurr++ = (uint8_t)a;
+                }
+                pEnd = &pCurr[iLimit - iBpp];
+                while (pCurr < pEnd) {
+                   int a, b, c, pa, pb, pc, p;
+                   c = pPrev[-iBpp];
+                   a = pCurr[-iBpp];
+                   b = *pPrev++;
+                   p = b - c;
+                   pc = a - c;
+                    // assume no native ABS() instruction
+                   pa = p < 0 ? -p : p;
+                   pb = pc < 0 ? -pc : pc;
+                   pc = (p + pc) < 0 ? -(p + pc) : p + pc;
+                   if (pb < pa) {
+                      pa = pb; a = b;
+                   }
+                   if (pc < pa) a = c;
+                   a += *pCurr;
+                   *pCurr++ = (uint8_t)a;
+                }
+            } // multi-byte
+            break;
+    } // switch on filter type
+} /* DeFilterLimited() */
+//
 // PNGInit
 // Parse the PNG file header and confirm that it's a valid file
 //
@@ -814,6 +1133,9 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
     z_stream d_stream; /* decompression stream */
     uint8_t *s = pPage->ucFileBuf;
     struct inflate_state *state;
+    PNG_ROI_SLOT *pROI = NULL;
+    int iROILastLine = 0, iROILimit = 0;
+    int iROIDrawWidth = 0, iROIDrawPitch = 0, iROIStartByte = 0;
     
     // Either the image buffer must be allocated or a draw callback must be set before entering
     if (pPage->pImage == NULL && pPage->pfnDraw == NULL) {
@@ -829,6 +1151,17 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
     y += (15 - (y & 15));
     pPrev = &pPage->ucPixels[y];
     pPage->iError = PNG_SUCCESS;
+    // Look up an optional region of interest for this decode
+    pROI = PNGROIFind(pPage);
+    if (pROI != NULL && (pROI->eff.w <= 0 || pROI->eff.h <= 0))
+        return PNG_SUCCESS; // empty ROI: nothing to decode
+    if (pROI != NULL) {
+        iROILastLine = pROI->eff.y + pROI->eff.h - 1;
+        iROILimit = pROI->iEndByte; // only defilter up to this many bytes
+        iROIDrawWidth = pROI->iDrawWidth;
+        iROIDrawPitch = pROI->iDrawPitch;
+        iROIStartByte = pROI->iStartByte;
+    }
     // Start decoding the image
     bDone = FALSE;
     // Inflate the compressed image data
@@ -933,7 +1266,7 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
                 }
                 break;
             case 0x49444154: //'IDAT' image data block
-                while (iLen) {
+                while (iLen && !bDone) {
                     if (iOffset >= iBytesRead) {
                         // we ran out of data; get some more
                         iBytesRead = (*pPage->pfnRead)(&pPage->PNGFile, pPage->ucFileBuf, (iLen > PNG_FILE_BUF_SIZE) ? PNG_FILE_BUF_SIZE : iLen);
@@ -962,48 +1295,79 @@ PNG_STATIC int DecodePNG(PNGIMAGE *pPage, void *pUser, int iOptions)
             //            d_stream.avail_in -= 4;
             //        }
                     err = 0;
-                    while (err == Z_OK) {
+                    while (err == Z_OK && !bDone) {
                         if (d_stream.avail_out == 0) { // reset for next line
                             d_stream.avail_out = pPage->iPitch+1;
                             d_stream.next_out = pCurr;
                         } // otherwise it could be a continuation of an unfinished line
                         err = inflate(&d_stream, Z_NO_FLUSH, iOptions & PNG_CHECK_CRC);
                         if ((err == Z_OK || err == Z_STREAM_END) && d_stream.avail_out == 0) {// successfully decoded line
-                            DeFilter(pCurr, pPrev, pPage->iWidth, pPage->iPitch);
-                            if (pPage->pImage == NULL) { // no image buffer, send it line by line
-                                PNGDRAW pngd;
-                                pngd.pUser = pUser;
-                                pngd.iPitch = pPage->iPitch;
-                                pngd.iWidth = pPage->iWidth;
-                                pngd.pPalette = pPage->ucPalette;
-                                pngd.pFastPalette = (iOptions & PNG_FAST_PALETTE) ? (uint16_t *)&pPage->ucPixels[sizeof(pPage->ucPixels)-512] : NULL;
-                                pngd.pPixels = pCurr+1;
-                                pngd.iPixelType = pPage->ucPixelType;
-                                pngd.iHasAlpha = pPage->iHasAlpha;
-                                pngd.iBpp = pPage->ucBpp;
-                                pngd.y = y;
-                                if (!(*pPage->pfnDraw)(&pngd)) {
-                                    pPage->iError = PNG_QUIT_EARLY;
-                                    bDone = TRUE;
+                            if (pROI == NULL) {
+                                // Full image decode - original path, byte for byte unchanged
+                                DeFilter(pCurr, pPrev, pPage->iWidth, pPage->iPitch);
+                                if (pPage->pImage == NULL) { // no image buffer, send it line by line
+                                    PNGDRAW pngd;
+                                    pngd.pUser = pUser;
+                                    pngd.iPitch = pPage->iPitch;
+                                    pngd.iWidth = pPage->iWidth;
+                                    pngd.pPalette = pPage->ucPalette;
+                                    pngd.pFastPalette = (iOptions & PNG_FAST_PALETTE) ? (uint16_t *)&pPage->ucPixels[sizeof(pPage->ucPixels)-512] : NULL;
+                                    pngd.pPixels = pCurr+1;
+                                    pngd.iPixelType = pPage->ucPixelType;
+                                    pngd.iHasAlpha = pPage->iHasAlpha;
+                                    pngd.iBpp = pPage->ucBpp;
+                                    pngd.y = y;
+                                    if (!(*pPage->pfnDraw)(&pngd)) {
+                                        pPage->iError = PNG_QUIT_EARLY;
+                                        bDone = TRUE;
+                                    }
+                                } else {
+                                    // copy to destination bitmap
+                                    memcpy(&pPage->pImage[y * pPage->iPitch], &pCurr[1], pPage->iPitch);
                                 }
                             } else {
-                                // copy to destination bitmap
-                                memcpy(&pPage->pImage[y * pPage->iPitch], &pCurr[1], pPage->iPitch);
+                                // ROI decode - reconstruct only the bytes the ROI needs
+                                DeFilterLimited(pCurr, pPrev, pPage->iWidth, pPage->iPitch, iROILimit);
+                                if (y >= pROI->eff.y) { // this line belongs to the ROI
+                                    if (pPage->pImage == NULL) { // deliver the ROI span through the draw callback
+                                        PNGDRAW pngd;
+                                        pngd.pUser = pUser;
+                                        pngd.iPitch = iROIDrawPitch;
+                                        pngd.iWidth = iROIDrawWidth;
+                                        pngd.pPalette = pPage->ucPalette;
+                                        pngd.pFastPalette = (iOptions & PNG_FAST_PALETTE) ? (uint16_t *)&pPage->ucPixels[sizeof(pPage->ucPixels)-512] : NULL;
+                                        pngd.pPixels = &pCurr[1 + iROIStartByte];
+                                        pngd.iPixelType = pPage->ucPixelType;
+                                        pngd.iHasAlpha = pPage->iHasAlpha;
+                                        pngd.iBpp = pPage->ucBpp;
+                                        pngd.y = y;
+                                        if (!(*pPage->pfnDraw)(&pngd)) {
+                                            pPage->iError = PNG_QUIT_EARLY;
+                                            bDone = TRUE;
+                                        }
+                                    } else {
+                                        // copy just the ROI span into its place in the destination bitmap
+                                        memcpy(&pPage->pImage[y * pPage->iPitch + iROIStartByte],
+                                               &pCurr[1 + iROIStartByte], iROIDrawPitch);
+                                    }
+                                }
                             }
                             y++;
                         // swap current and previous lines
                         tmp = pCurr; pCurr = pPrev; pPrev = tmp;
+                        // The last ROI row has been delivered; everything below
+                        // it is unneeded, so stop the whole decode cleanly.
+                        if (pROI != NULL && y > iROILastLine)
+                            bDone = TRUE;
                         } else { // some error
                             tmp = NULL;
                         }
                     }
                     if (err == Z_STREAM_END && d_stream.avail_out == 0) {
                         // successful decode, stop here
-                        y = pPage->iHeight;
                         bDone = TRUE;
                     } else  if (err == Z_DATA_ERROR || err == Z_STREAM_ERROR) {
                         iLen = 0; // quit now
-                        y = pPage->iHeight;
                         pPage->iError = PNG_DECODE_ERROR;
                         bDone = TRUE; // force loop to exit with error
                     } else if (err == Z_BUF_ERROR) {
