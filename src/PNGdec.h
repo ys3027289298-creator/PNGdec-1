@@ -117,6 +117,11 @@ enum {
     PNG_RGB565_BIG_ENDIAN
 };
 
+// Option flags for getLineAsRGBA8888() / decodeRGBA8888()
+enum {
+    PNG_RGBA8888_PREMULTIPLY = 1 // premultiply the color channels by the alpha channel
+};
+
 enum {
     PNG_MEM_RAM=0,
     PNG_MEM_FLASH
@@ -198,10 +203,234 @@ class PNG
     void setBuffer(uint8_t *pBuffer);
     uint8_t getAlphaMask(PNGDRAW *pDraw, uint8_t *pMask, uint8_t ucThreshold);
     void getLineAsRGB565(PNGDRAW *pDraw, uint16_t *pPixels, int iEndianness, uint32_t u32Bkgd);
+    // Convert a line of native pixels (all supported types) into RGBA8888
+    // (byte order R,G,B,A in memory). iFlags: 0 or PNG_RGBA8888_PREMULTIPLY
+    int getLineAsRGBA8888(PNGDRAW *pDraw, uint32_t *pPixels, int iFlags);
+    // Decode the image (or only the rows [yStart, yStart+yCount)) to RGBA8888.
+    // pOut must point to yCount * getWidth() uint32_t pixels. Decoding stops
+    // after the last requested row, so trailing rows cost no time nor memory.
+    int decodeRGBA8888(uint32_t *pOut, int yStart, int yCount, int iFlags);
 
   private:
+    typedef struct rgba8888_ctx_tag {
+        PNG *pPNG;
+        uint32_t *pOut;
+        int yStart, yCount, iFlags;
+    } RGBA8888CTX;
+    static int RGBA8888Draw(PNGDRAW *pDraw);
+    static void PremultiplyRGBA8888(uint32_t *pPixels, int iWidth);
     PNGIMAGE _png;
 };
+//
+// Premultiply a line of RGBA8888 pixels by its alpha channel
+//
+inline void PNG::PremultiplyRGBA8888(uint32_t *pPixels, int iWidth)
+{
+    for (int x = 0; x < iWidth; x++) {
+        uint32_t u32 = pPixels[x];
+        uint32_t a = u32 >> 24;
+        if (a != 255) {
+            uint32_t r = (((u32 & 0xff) * a) + 127) / 255;
+            uint32_t g = ((((u32 >> 8) & 0xff) * a) + 127) / 255;
+            uint32_t b = ((((u32 >> 16) & 0xff) * a) + 127) / 255;
+            pPixels[x] = r | (g << 8) | (b << 16) | (a << 24);
+        }
+    }
+} /* PremultiplyRGBA8888() */
+//
+// Convert a line of native PNG pixels (all supported types) into RGBA8888
+// Each output uint32_t holds R,G,B,A in memory byte order (0xAABBGGRR)
+//
+inline int PNG::getLineAsRGBA8888(PNGDRAW *pDraw, uint32_t *pPixels, int iFlags)
+{
+    int x, j;
+    uint8_t c=0, a, *pPal, *s;
+    uint32_t *pDest = pPixels;
+
+    if (pDraw == NULL || pPixels == NULL || pDraw->pPixels == NULL)
+        return PNG_INVALID_PARAMETER;
+    if (iFlags & ~PNG_RGBA8888_PREMULTIPLY) // unknown option bits
+        return PNG_INVALID_PARAMETER;
+    s = pDraw->pPixels;
+    switch (pDraw->iPixelType) {
+        case PNG_PIXEL_GRAYSCALE:
+            switch (pDraw->iBpp) {
+                case 8:
+                    for (x=0; x<pDraw->iWidth; x++) {
+                        c = *s++;
+                        *pDest++ = 0xff000000 | (c * 0x010101);
+                    }
+                    break;
+                case 4:
+                    for (x=0; x<pDraw->iWidth; x++) {
+                        if ((x & 1) == 0)
+                            c = *s++;
+                        j = (x & 1) ? ((c & 0xf) | ((c << 4) & 0xf0)) : ((c & 0xf0) | (c >> 4));
+                        *pDest++ = 0xff000000 | (j * 0x010101);
+                    }
+                    break;
+                case 2:
+                    for (x=0; x<pDraw->iWidth; x++) {
+                        if ((x & 3) == 0)
+                            c = *s++;
+                        j = (c >> 6) * 0x55;
+                        *pDest++ = 0xff000000 | (j * 0x010101);
+                        c <<= 2;
+                    }
+                    break;
+                case 1:
+                    for (x=0; x<pDraw->iWidth; x++) {
+                        if ((x & 7) == 0)
+                            c = *s++;
+                        j = (c & 0x80) ? 0xff : 0;
+                        *pDest++ = 0xff000000 | (j * 0x010101);
+                        c <<= 1;
+                    }
+                    break;
+                default:
+                    return PNG_UNSUPPORTED_FEATURE;
+            } // switch on bpp
+            break;
+        case PNG_PIXEL_GRAY_ALPHA:
+            for (x=0; x<pDraw->iWidth; x++) {
+                c = *s++; // gray level
+                a = *s++; // alpha
+                *pDest++ = ((uint32_t)a << 24) | (c * 0x010101);
+            }
+            break;
+        case PNG_PIXEL_TRUECOLOR:
+            for (x=0; x<pDraw->iWidth; x++) {
+                *pDest++ = 0xff000000 | s[0] | (s[1] << 8) | (s[2] << 16);
+                s += 3;
+            }
+            break;
+        case PNG_PIXEL_TRUECOLOR_ALPHA:
+            for (x=0; x<pDraw->iWidth; x++) {
+                *pDest++ = s[0] | (s[1] << 8) | (s[2] << 16) | ((uint32_t)s[3] << 24);
+                s += 4;
+            }
+            break;
+        case PNG_PIXEL_INDEXED: // palette color (1/2/4/8 bits per pixel)
+            for (x=0; x<pDraw->iWidth; x++) {
+                switch (pDraw->iBpp) {
+                    case 8:
+                        j = *s++;
+                        break;
+                    case 4:
+                        if ((x & 1) == 0)
+                            c = *s++;
+                        j = (x & 1) ? (c & 0xf) : (c >> 4);
+                        break;
+                    case 2:
+                        if ((x & 3) == 0)
+                            c = *s++;
+                        j = c >> 6;
+                        c <<= 2;
+                        break;
+                    case 1:
+                        if ((x & 7) == 0)
+                            c = *s++;
+                        j = c >> 7;
+                        c <<= 1;
+                        break;
+                    default:
+                        return PNG_UNSUPPORTED_FEATURE;
+                }
+                pPal = &pDraw->pPalette[j * 3];
+                a = (pDraw->iHasAlpha) ? pDraw->pPalette[768 + j] : 0xff;
+                *pDest++ = ((uint32_t)a << 24) | pPal[0] | (pPal[1] << 8) | (pPal[2] << 16);
+            }
+            break;
+        default:
+            return PNG_UNSUPPORTED_FEATURE;
+    } // switch on pixel type
+    if (iFlags & PNG_RGBA8888_PREMULTIPLY)
+        PremultiplyRGBA8888(pPixels, pDraw->iWidth);
+    return PNG_SUCCESS;
+} /* getLineAsRGBA8888() */
+//
+// Internal draw callback for decodeRGBA8888()
+// Skips rows outside the requested range and stops the decode early
+// once the last requested row has been delivered
+//
+inline int PNG::RGBA8888Draw(PNGDRAW *pDraw)
+{
+    RGBA8888CTX *pCtx = (RGBA8888CTX *)pDraw->pUser;
+    PNG *pPNG = pCtx->pPNG;
+    int y = pDraw->y;
+    int x;
+    uint32_t *pDest;
+
+    if (y < pCtx->yStart)
+        return 1; // skip rows above the requested range
+    if (y >= pCtx->yStart + pCtx->yCount)
+        return 0; // past the requested range: stop decoding early
+    pDest = &pCtx->pOut[(y - pCtx->yStart) * pDraw->iWidth];
+    pPNG->getLineAsRGBA8888(pDraw, pDest, pCtx->iFlags & ~PNG_RGBA8888_PREMULTIPLY);
+    // Apply tRNS transparency for grayscale and truecolor images; the
+    // transparent color is not part of the PNGDRAW structure
+    if (pPNG->_png.iHasAlpha && pPNG->_png.ucBpp == 8) {
+        if (pPNG->_png.ucPixelType == PNG_PIXEL_GRAYSCALE) {
+            uint32_t u32T = pPNG->_png.iTransparent & 0xff;
+            for (x = 0; x < pDraw->iWidth; x++) {
+                if ((pDest[x] & 0xff) == u32T)
+                    pDest[x] &= 0x00ffffff; // transparent pixel
+            }
+        } else if (pPNG->_png.ucPixelType == PNG_PIXEL_TRUECOLOR) {
+            uint32_t u32T = ((pPNG->_png.iTransparent >> 16) & 0xff) | // R
+                            (pPNG->_png.iTransparent & 0xff00) |         // G
+                            ((pPNG->_png.iTransparent & 0xff) << 16);    // B
+            for (x = 0; x < pDraw->iWidth; x++) {
+                if ((pDest[x] & 0xffffff) == u32T)
+                    pDest[x] &= 0x00ffffff; // transparent pixel
+            }
+        }
+    }
+    if (pCtx->iFlags & PNG_RGBA8888_PREMULTIPLY)
+        PremultiplyRGBA8888(pDest, pDraw->iWidth);
+    return 1;
+} /* RGBA8888Draw() */
+//
+// Decode the image (or a range of its rows) directly into RGBA8888 pixels
+// The three stages (RGBA8888 conversion, premultiply, row range) are
+// controlled independently: conversion is always on, premultiply is an
+// iFlags bit, and the row range is set by yStart/yCount
+//
+inline int PNG::decodeRGBA8888(uint32_t *pOut, int yStart, int yCount, int iFlags)
+{
+    RGBA8888CTX ctx;
+    PNG_DRAW_CALLBACK *pfnOld;
+    int rc;
+
+    if (pOut == NULL || yStart < 0 || yCount <= 0 || yStart >= _png.iHeight) {
+        _png.iError = PNG_INVALID_PARAMETER;
+        return PNG_INVALID_PARAMETER;
+    }
+    if (iFlags & ~PNG_RGBA8888_PREMULTIPLY) { // unknown option bits
+        _png.iError = PNG_INVALID_PARAMETER;
+        return PNG_INVALID_PARAMETER;
+    }
+    if (_png.pImage != NULL) { // incompatible with setBuffer() whole-image mode
+        _png.iError = PNG_INVALID_PARAMETER;
+        return PNG_INVALID_PARAMETER;
+    }
+    if (yStart + yCount > _png.iHeight)
+        yCount = _png.iHeight - yStart; // clamp to the image bounds
+    ctx.pPNG = this;
+    ctx.pOut = pOut;
+    ctx.yStart = yStart;
+    ctx.yCount = yCount;
+    ctx.iFlags = iFlags;
+    pfnOld = _png.pfnDraw;
+    _png.pfnDraw = RGBA8888Draw;
+    rc = decode(&ctx, 0);
+    _png.pfnDraw = pfnOld;
+    if (rc == PNG_QUIT_EARLY) { // we intentionally stopped after the last row
+        _png.iError = PNG_SUCCESS;
+        rc = PNG_SUCCESS;
+    }
+    return rc;
+} /* decodeRGBA8888() */
 #else
 #define PNG_STATIC
 int PNG_openRAM(PNGIMAGE *pPNG, uint8_t *pData, int iDataSize, PNG_DRAW_CALLBACK *pfnDraw);
